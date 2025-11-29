@@ -47,22 +47,22 @@ type EveStats struct {
 }
 
 type EveFlowStats struct {
-	PacketRate      float64 `json:"packet_rate,omitempty"`
-	PacketThreshold float64 `json:"packet_threshold,omitempty"`
-	IPRate          float64 `json:"ip_rate,omitempty"`
-	IPRateThreshold float64 `json:"ip_rate_threshold,omitempty"`
+	PacketRate               float64 `json:"packet_rate,omitempty"`
+	PacketThreshold          float64 `json:"packet_threshold,omitempty"`
+	DestinationRate          float64 `json:"destination_rate,omitempty"`
+	DestinationRateThreshold float64 `json:"destination_rate_threshold,omitempty"`
 }
 
 // EveDetails keeps gomon specific metadata grouped under a dedicated object.
 type EveDetails struct {
-	Scope           BehaviorScope `json:"scope,omitempty"`
-	C2IP            *string       `json:"c2_ip,omitempty"` // easier handling of nil values from behavior
-	PacketRate      float64       `json:"packet_rate,omitempty"`
-	PacketThreshold float64       `json:"packet_threshold,omitempty"`
-	IPRate          float64       `json:"ip_rate,omitempty"`
-	IPRateThreshold float64       `json:"ip_rate_threshold,omitempty"`
-	DestPort        *uint16       `json:"dest_port,omitempty"`
-	Proto           string        `json:"proto,omitempty"`
+	Scope                    BehaviorScope `json:"scope,omitempty"`
+	C2IP                     *string       `json:"c2_ip,omitempty"` // easier handling of nil values from behavior
+	PacketRate               float64       `json:"packet_rate,omitempty"`
+	PacketThreshold          float64       `json:"packet_threshold,omitempty"`
+	DestinationRate          float64       `json:"destination_rate,omitempty"`
+	DestinationRateThreshold float64       `json:"destination_rate_threshold,omitempty"`
+	DestPort                 *uint16       `json:"dest_port,omitempty"`
+	Proto                    string        `json:"proto,omitempty"`
 }
 
 func NewEveLogger(w io.Writer) *EveLogger {
@@ -177,10 +177,10 @@ func newEveStats(behavior *Behavior) *EveStats {
 
 	return &EveStats{
 		Flow: &EveFlowStats{
-			PacketRate:      behavior.PacketRate,
-			PacketThreshold: behavior.PacketThreshold,
-			IPRate:          behavior.IPRate,
-			IPRateThreshold: behavior.IPRateThreshold,
+			PacketRate:               behavior.PacketRate,
+			PacketThreshold:          behavior.PacketThreshold,
+			DestinationRate:          behavior.DestinationRate,
+			DestinationRateThreshold: behavior.DestinationRateThreshold,
 		},
 	}
 }
@@ -191,14 +191,14 @@ func newEveDetails(behavior *Behavior) *EveDetails {
 	}
 
 	d := &EveDetails{
-		Scope:           behavior.Scope,
-		C2IP:            behavior.C2IP,
-		PacketRate:      behavior.PacketRate,
-		PacketThreshold: behavior.PacketThreshold,
-		IPRate:          behavior.IPRate,
-		IPRateThreshold: behavior.IPRateThreshold,
-		DestPort:        behavior.DstPort,
-		Proto:           behavior.Proto,
+		Scope:                    behavior.Scope,
+		C2IP:                     behavior.C2IP,
+		PacketRate:               behavior.PacketRate,
+		PacketThreshold:          behavior.PacketThreshold,
+		DestinationRate:          behavior.DestinationRate,
+		DestinationRateThreshold: behavior.DestinationRateThreshold,
+		DestPort:                 behavior.DstPort,
+		Proto:                    behavior.Proto,
 	}
 
 	return d

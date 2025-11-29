@@ -27,25 +27,25 @@ const asciiBanner = `
         \_____\/   \_____\/ \__\/ \__\/ \_____\/ \__\/ \__\/`
 
 const (
-	defaultWindowSizeS        = 30
-	defaultPacketRateThresh   = 5.0
-	defaultUniqueIPRateThresh = 10.0
-	defaultLogLevel           = "info"
+	defaultWindowSizeS           = 30
+	defaultPacketRateThresh      = 5.0
+	defaultDestinationRateThresh = 10.0
+	defaultLogLevel              = "info"
 )
 
 var (
-	packetRateThreshold   = defaultPacketRateThresh
-	uniqueIPRateThreshold = defaultUniqueIPRateThresh
-	logLevelStr           = defaultLogLevel
-	windowSizeSeconds     = defaultWindowSizeS
-	captureDirPath        string
-	showIdle              bool
-	c2IP                  string
-	sampleID              string
-	ignoreDestIPs         []string
-	eveLogPath            string
-	savePacketsCount      int
-	showVersionOnly       bool
+	packetRateThreshold      = defaultPacketRateThresh
+	destinationRateThreshold = defaultDestinationRateThresh
+	logLevelStr              = defaultLogLevel
+	windowSizeSeconds        = defaultWindowSizeS
+	captureDirPath           string
+	showIdle                 bool
+	c2IP                     string
+	sampleID                 string
+	ignoreDestIPs            []string
+	eveLogPath               string
+	savePacketsCount         int
+	showVersionOnly          bool
 )
 
 var version = resolveVersion()
@@ -60,9 +60,9 @@ func init() {
 		"Packet rate threshold per window before marking traffic as suspicious.",
 	)
 	RootCmd.Flags().Float64Var(
-		&uniqueIPRateThreshold,
-		"ip-threshold",
-		defaultUniqueIPRateThresh,
+		&destinationRateThreshold,
+		"destination-threshold",
+		defaultDestinationRateThresh,
 		"Destination endpoint (IP/port/protocol) diversity threshold per window before flagging a scan.",
 	)
 	RootCmd.Flags().StringVar(
@@ -160,8 +160,8 @@ func executeAnalysis(cmd *cobra.Command, args []string) error {
 	if packetRateThreshold <= 0 {
 		return fmt.Errorf("packet-threshold must be greater than 0, received %f", packetRateThreshold)
 	}
-	if uniqueIPRateThreshold < 0 {
-		return fmt.Errorf("ip-threshold must be non-negative, received %f", uniqueIPRateThreshold)
+	if destinationRateThreshold < 0 {
+		return fmt.Errorf("destination-threshold must be non-negative, received %f", destinationRateThreshold)
 	}
 	if windowSizeSeconds <= 0 {
 		return fmt.Errorf("window must be greater than 0, received %d", windowSizeSeconds)
@@ -190,7 +190,7 @@ func executeAnalysis(cmd *cobra.Command, args []string) error {
 		time.Duration(windowSizeSeconds)*time.Second,
 		eveLogPath,
 		packetRateThreshold,
-		uniqueIPRateThreshold,
+		destinationRateThreshold,
 		level,
 		sampleID,
 		savePacketsCount,
@@ -336,7 +336,7 @@ func renderRuntimeConfiguration(args []string) string {
 	fmt.Fprintf(&b, "  source-ip: %s\n", srcArg)
 	fmt.Fprintf(&b, "  window: %s\n", window)
 	fmt.Fprintf(&b, "  packet-threshold: %.2f\n", packetRateThreshold)
-	fmt.Fprintf(&b, "  ip-threshold: %.2f\n", uniqueIPRateThreshold)
+	fmt.Fprintf(&b, "  destination-threshold: %.2f\n", destinationRateThreshold)
 	fmt.Fprintf(&b, "  log-level: %s\n", logLevelStr)
 	fmt.Fprintf(&b, "  show-idle: %t\n", showIdle)
 	fmt.Fprintf(&b, "  c2-ip: %s\n", c2Display)

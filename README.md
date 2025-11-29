@@ -43,7 +43,7 @@ gomon version v0.1.0   # or dev (<commit>) if built from a workspace
 gomon sample.pcap 10.0.0.5 \
   --window 15 \
   --packet-threshold 20 \
-  --ip-threshold 25 \
+  --destination-threshold 25 \
   --eve-log-path /tmp/sample-eve.json
 
 # Stream directly from an interface while preserving packet artifacts
@@ -69,7 +69,7 @@ At startup `gomon` prints an ASCII banner and a configuration block containing e
 | --- | --- | --- |
 | `--window` | Analysis window size in seconds. | `30` |
 | `--packet-threshold` | Packet rate per window that triggers an alert. | `5` |
-| `--ip-threshold` | Unique destination endpoints (IP/port/proto) per window before flagging a scan. | `10` |
+| `--destination-threshold` | Unique destination endpoints (IP/port/proto) per window before flagging a scan. | `10` |
 | `--log-level` | Logging verbosity (`debug`, `info`, `warn`, `error`). | `info` |
 | `--show-idle` | Emit idle window events instead of alerts only. | `false` |
 | `--eve-log-path` | Write Eve JSON to this file instead of stdout. | _stdout_ |

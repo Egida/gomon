@@ -19,10 +19,10 @@ const defaultMaxDestinations = 1024
 
 type AnalysisConfiguration struct {
 	// configuration
-	PacketRateThreshold float64
-	IPRateThreshold     float64
-	Window              time.Duration
-	maxDestinations     int // maximum number of destinations to analyze per window
+	PacketRateThreshold      float64
+	DestinationRateThreshold float64
+	Window                   time.Duration
+	maxDestinations          int // maximum number of destinations to analyze per window
 
 	// extra logging options
 	showIdle    bool // emit idle windows when requested
@@ -79,7 +79,7 @@ func NewAnalysisConfiguration(
 	window time.Duration,
 	filePath string,
 	PacketThreshold float64,
-	IPThreshold float64,
+	destinationThreshold float64,
 	level slog.Level,
 	sampleID string,
 	savePackets int,
@@ -133,17 +133,17 @@ func NewAnalysisConfiguration(
 	}
 
 	return &AnalysisConfiguration{
-		logger:              logger,
-		eventLogger:         eventLogger,
-		eventFile:           file,
-		PacketRateThreshold: PacketThreshold,
-		IPRateThreshold:     IPThreshold,
-		Window:              window,
-		showIdle:            showIdle,
-		savePackets:         savePackets,
-		captureDir:          captureDir,
-		buffers:             buffers,
-		ignoredIP:           ignored,
+		logger:                   logger,
+		eventLogger:              eventLogger,
+		eventFile:                file,
+		PacketRateThreshold:      PacketThreshold,
+		DestinationRateThreshold: destinationThreshold,
+		Window:                   window,
+		showIdle:                 showIdle,
+		savePackets:              savePackets,
+		captureDir:               captureDir,
+		buffers:                  buffers,
+		ignoredIP:                ignored,
 		context: AnalysisContext{
 			srcIP:            srcIP,
 			c2IP:             c2IP,
@@ -179,10 +179,10 @@ type Behavior struct {
 	Scope          BehaviorScope `json:"scope"`      // Indicates the scope of the behavior (global/local)
 	Timestamp      time.Time     `json:"@timestamp"` // @timestamp to comply with Elastic
 
-	PacketRate      float64 `json:"packet_rate"`
-	PacketThreshold float64 `json:"packet_threshold"`
-	IPRate          float64 `json:"ip_rate"`
-	IPRateThreshold float64 `json:"ip_rate_threshold"`
+	PacketRate               float64 `json:"packet_rate"`
+	PacketThreshold          float64 `json:"packet_threshold"`
+	DestinationRate          float64 `json:"destination_rate"`
+	DestinationRateThreshold float64 `json:"destination_rate_threshold"`
 
 	SampleID string  `json:"sample_id"`
 	SrcIP    *string `json:"src_ip"`
@@ -203,8 +203,8 @@ func NewBehavior(
 	eventTime time.Time,
 	packetRate float64,
 	packetThreshold float64,
-	ipRate float64,
-	ipRateThreshold float64,
+	destinationRate float64,
+	destinationRateThreshold float64,
 	destination *Destination,
 	destinationLabels *[]string,
 	context *AnalysisContext,
@@ -214,13 +214,13 @@ func NewBehavior(
 	}
 
 	b := &Behavior{
-		Classification:  classification,
-		Scope:           scope,
-		Timestamp:       eventTime,
-		PacketRate:      packetRate,
-		PacketThreshold: packetThreshold,
-		IPRate:          ipRate,
-		IPRateThreshold: ipRateThreshold,
+		Classification:           classification,
+		Scope:                    scope,
+		Timestamp:                eventTime,
+		PacketRate:               packetRate,
+		PacketThreshold:          packetThreshold,
+		DestinationRate:          destinationRate,
+		DestinationRateThreshold: destinationRateThreshold,
 	}
 
 	if context != nil {
@@ -595,13 +595,13 @@ func (config *AnalysisConfiguration) classifyGlobalBehavior(
 
 	// detected a scan when the new destination rate exceeds the configured threshold,
 	// regardless of whether the packet-rate condition was satisfied
-	if newDestinationRate > config.IPRateThreshold {
+	if newDestinationRate > config.DestinationRateThreshold {
 		config.logger.Debug(
 			"Detected high new destination rate",
 			"scope", Global,
 			"eventTime", eventTime,
-			"newIPRate", newDestinationRate,
-			"threshold", config.IPRateThreshold,
+			"newDestinationRate", newDestinationRate,
+			"threshold", config.DestinationRateThreshold,
 		)
 
 		return NewBehavior(
@@ -611,7 +611,7 @@ func (config *AnalysisConfiguration) classifyGlobalBehavior(
 			globalPacketRate,
 			config.PacketRateThreshold,
 			newDestinationRate,
-			config.IPRateThreshold,
+			config.DestinationRateThreshold,
 			nil,
 			destinationLabels,
 			&config.context,
@@ -625,7 +625,7 @@ func (config *AnalysisConfiguration) classifyGlobalBehavior(
 		globalPacketRate,
 		config.PacketRateThreshold,
 		newDestinationRate,
-		config.IPRateThreshold,
+		config.DestinationRateThreshold,
 		nil,
 		destinationLabels,
 		&config.context,

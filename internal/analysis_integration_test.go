@@ -88,8 +88,8 @@ func TestEveScanFormatting(t *testing.T) {
 	if gomon == nil || gomon.C2IP == nil || *gomon.C2IP != "203.0.113.50" {
 		t.Fatalf("expected gomon.c2_ip 203.0.113.50, got %#v", gomon)
 	}
-	if gomon.IPRate < 3 {
-		t.Fatalf("expected ip_rate >= 3, got %v", gomon.IPRate)
+	if gomon.DestinationRate < 3 {
+		t.Fatalf("expected destination_rate >= 3, got %v", gomon.DestinationRate)
 	}
 }
 
@@ -276,7 +276,7 @@ func TestMultiPortSingleHostTriggersScan(t *testing.T) {
 	}
 }
 
-func newTestAnalysisConfigWithC2(w io.Writer, c2 string, packetThresh, ipThresh float64) *AnalysisConfiguration {
+func newTestAnalysisConfigWithC2(w io.Writer, c2 string, packetThresh, destinationThresh float64) *AnalysisConfiguration {
 	config := NewAnalysisConfiguration(
 		"10.0.0.5",
 		c2,
@@ -285,7 +285,7 @@ func newTestAnalysisConfigWithC2(w io.Writer, c2 string, packetThresh, ipThresh 
 		time.Second,
 		"",
 		packetThresh,
-		ipThresh,
+		destinationThresh,
 		slog.LevelError,
 		"sample-1",
 		0,
@@ -329,13 +329,13 @@ type parsedAlert struct {
 }
 
 type parsedGomon struct {
-	C2IP            *string `json:"c2_ip"`
-	PacketRate      float64 `json:"packet_rate"`
-	PacketThreshold float64 `json:"packet_threshold"`
-	IPRate          float64 `json:"ip_rate"`
-	IPRateThreshold float64 `json:"ip_rate_threshold"`
-	DestPort        *uint16 `json:"dest_port"`
-	Proto           string  `json:"proto"`
+	C2IP                     *string `json:"c2_ip"`
+	PacketRate               float64 `json:"packet_rate"`
+	PacketThreshold          float64 `json:"packet_threshold"`
+	DestinationRate          float64 `json:"destination_rate"`
+	DestinationRateThreshold float64 `json:"destination_rate_threshold"`
+	DestPort                 *uint16 `json:"dest_port"`
+	Proto                    string  `json:"proto"`
 }
 
 func parseEveEvents(t *testing.T, data []byte) []parsedEveEvent {
