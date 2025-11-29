@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -44,9 +45,14 @@ var (
 	ignoreDestIPs         []string
 	eveLogPath            string
 	savePacketsCount      int
+	showVersionOnly       bool
 )
 
+var version = resolveVersion()
+
 func init() {
+	RootCmd.SetVersionTemplate("gomon version {{.Version}}\n")
+	RootCmd.Version = version
 	RootCmd.Flags().Float64Var(
 		&packetRateThreshold,
 		"packet-threshold",
@@ -113,6 +119,12 @@ func init() {
 		0,
 		"Number of most recent packets per host to retain for capture artifacts when an attack is detected.",
 	)
+	RootCmd.Flags().BoolVar(
+		&showVersionOnly,
+		"version",
+		false,
+		"Print the gomon version and exit.",
+	)
 }
 
 var RootCmd = &cobra.Command{
@@ -124,6 +136,10 @@ structured alerts that highlight scans or bursts of suspicious activity.`,
 	Example: "gomon sample.pcap 10.0.0.5 --window 15 --packet-threshold 20 --log-level info --c2-ip 203.0.113.4 --ignore-dst 192.0.2.10 --sample-id malware-sample-42",
 	Args:    cobra.ExactArgs(2),
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		if showVersionOnly {
+			cmd.Printf("gomon version %s\n", version)
+			os.Exit(0)
+		}
 		cmd.Println(asciiBanner)
 		cmd.Println()
 		cmd.Print(renderRuntimeConfiguration(args))
@@ -315,6 +331,7 @@ func renderRuntimeConfiguration(args []string) string {
 
 	var b strings.Builder
 	b.WriteString("Configuration:\n")
+	fmt.Fprintf(&b, "  version: %s\n", version)
 	fmt.Fprintf(&b, "  input: %s\n", inputArg)
 	fmt.Fprintf(&b, "  source-ip: %s\n", srcArg)
 	fmt.Fprintf(&b, "  window: %s\n", window)
@@ -330,4 +347,30 @@ func renderRuntimeConfiguration(args []string) string {
 	fmt.Fprintf(&b, "  eve-log-path: %s\n", eveDestination)
 
 	return b.String()
+}
+
+func resolveVersion() string {
+	const fallback = "dev"
+
+	v := fallback
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+			v = info.Main.Version
+		} else if rev := lookupBuildSetting(info.Settings, "vcs.revision"); rev != "" {
+			if len(rev) > 7 {
+				rev = rev[:7]
+			}
+			v = fmt.Sprintf("%s (%s)", fallback, rev)
+		}
+	}
+	return v
+}
+
+func lookupBuildSetting(settings []debug.BuildSetting, key string) string {
+	for _, setting := range settings {
+		if setting.Key == key {
+			return setting.Value
+		}
+	}
+	return ""
 }
