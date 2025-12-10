@@ -95,9 +95,11 @@ func CaptureLoop(handle *pcap.Handle, config *AnalysisConfiguration) error {
 				)
 			}
 
-			if len(cur) == 0 {
+			// Initialize the window start once; keep it stable across capacity handoffs
+			// so we still flush when the duration elapses.
+			if windowStart.IsZero() {
 				windowStart = ts
-			} else if ts.Sub(windowStart) >= config.Window {
+			} else if len(cur) > 0 && ts.Sub(windowStart) >= config.Window {
 				config.logger.Debug(
 					"Handing off packet batch due to elapsed window",
 					"count", len(cur),
@@ -133,12 +135,15 @@ func worker(config *AnalysisConfiguration, in <-chan windowBatch, done chan<- st
 	var previous windowBatch
 
 	for batch := range in {
+		config.ProcessBatch(previous.packets, batch.packets, batch.start)
+		pps := float64(len(batch.packets)) / -time.Until(batch.start).Seconds()
 		config.logger.Debug(
-			"Processing packet window",
+			"Processed packet window",
 			"previousCount", len(previous.packets),
 			"currentCount", len(batch.packets),
+			"pps", pps,
 		)
-		config.ProcessBatch(previous.packets, batch.packets, batch.start)
+
 		if batch.complete {
 			config.flushResults()
 		}
