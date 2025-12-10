@@ -135,8 +135,9 @@ func worker(config *AnalysisConfiguration, in <-chan windowBatch, done chan<- st
 	var previous windowBatch
 
 	for batch := range in {
+		process_start := time.Now()
 		config.ProcessBatch(previous.packets, batch.packets, batch.start)
-		pps := float64(len(batch.packets)) / -time.Until(batch.start).Seconds()
+		pps := float64(len(batch.packets)) / -time.Until(process_start).Seconds()
 		config.logger.Debug(
 			"Processed packet window",
 			"previousCount", len(previous.packets),
