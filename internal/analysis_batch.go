@@ -22,6 +22,7 @@ type AnalysisConfiguration struct {
 	PacketRateThreshold      float64
 	DestinationRateThreshold float64
 	Window                   time.Duration
+	destinationRateMode      DestinationRateMode
 	maxDestinations          int // maximum number of destinations to analyze per window
 
 	// extra logging options
@@ -35,11 +36,12 @@ type AnalysisConfiguration struct {
 	logger      *slog.Logger
 	eventLogger *EveLogger
 
-	result          batchResult
-	buffers         map[string]*packetRing
-	ignoredIP       map[string]struct{}
-	summary         AnalysisSummary
-	captureBehavior func(*AnalysisConfiguration, *Behavior) (bool, error)
+	result               batchResult
+	buffers              map[string]*packetRing
+	ignoredIP            map[string]struct{}
+	summary              AnalysisSummary
+	captureBehavior      func(*AnalysisConfiguration, *Behavior) (bool, error)
+	previousDestinations map[Destination]struct{}
 
 	// static context for logging
 	context AnalysisContext
@@ -55,6 +57,13 @@ type AnalysisSummary struct {
 func (s AnalysisSummary) TotalAlerts() int {
 	return s.AttackEvents + s.ScanEvents
 }
+
+type DestinationRateMode string
+
+const (
+	DestinationRateTotal DestinationRateMode = "total"
+	DestinationRateNew   DestinationRateMode = "new"
+)
 
 type batchResult struct {
 	windowStart               time.Time
@@ -80,6 +89,7 @@ func NewAnalysisConfiguration(
 	filePath string,
 	PacketThreshold float64,
 	destinationThreshold float64,
+	destinationRateMode DestinationRateMode,
 	level slog.Level,
 	sampleID string,
 	savePackets int,
@@ -132,6 +142,10 @@ func NewAnalysisConfiguration(
 		captureBehavior = defaultCaptureBehavior
 	}
 
+	if destinationRateMode == "" {
+		destinationRateMode = DestinationRateTotal
+	}
+
 	return &AnalysisConfiguration{
 		logger:                   logger,
 		eventLogger:              eventLogger,
@@ -139,6 +153,7 @@ func NewAnalysisConfiguration(
 		PacketRateThreshold:      PacketThreshold,
 		DestinationRateThreshold: destinationThreshold,
 		Window:                   window,
+		destinationRateMode:      destinationRateMode,
 		showIdle:                 showIdle,
 		savePackets:              savePackets,
 		captureDir:               captureDir,
@@ -407,12 +422,13 @@ func (config *AnalysisConfiguration) flushResults() {
 		"windowSeconds", durationSeconds,
 		"globalPacketCount", config.result.globalPacketCount,
 		"destinationPacketCounts", config.result.destinationPacketCounts,
-		"globalNewDestinations", config.result.globalNewDestinationCount,
+		"windowDestinationCount", len(config.result.destinationPacketCounts),
+		"destinationRateMode", config.destinationRateMode,
 	)
 
 	// first classify global behavior since it can be used by the local behavior
 	globalPacketRate := float64(config.result.globalPacketCount) / durationSeconds
-	globalDestinationRate := float64(config.result.globalNewDestinationCount) / durationSeconds
+	globalDestinationRate := config.computeDestinationRate(durationSeconds)
 	destinations := destinationLabels(config.result.destinationPacketCounts)
 
 	globalBehavior := config.classifyGlobalBehavior(
@@ -579,7 +595,7 @@ func (config *AnalysisConfiguration) classifyLocalBehavior(
 
 func (config *AnalysisConfiguration) classifyGlobalBehavior(
 	globalPacketRate float64,
-	newDestinationRate float64,
+	destinationRate float64,
 	destinationLabels *[]string,
 	eventTime time.Time,
 ) *Behavior {
@@ -593,14 +609,15 @@ func (config *AnalysisConfiguration) classifyGlobalBehavior(
 		)
 	}
 
-	// detected a scan when the new destination rate exceeds the configured threshold,
+	// detected a scan when the destination rate exceeds the configured threshold,
 	// regardless of whether the packet-rate condition was satisfied
-	if newDestinationRate > config.DestinationRateThreshold {
+	if destinationRate > config.DestinationRateThreshold {
 		config.logger.Debug(
-			"Detected high new destination rate",
+			"Detected high destination rate",
 			"scope", Global,
 			"eventTime", eventTime,
-			"newDestinationRate", newDestinationRate,
+			"destinationRate", destinationRate,
+			"destinationRateMode", config.destinationRateMode,
 			"threshold", config.DestinationRateThreshold,
 		)
 
@@ -610,7 +627,7 @@ func (config *AnalysisConfiguration) classifyGlobalBehavior(
 			eventTime,
 			globalPacketRate,
 			config.PacketRateThreshold,
-			newDestinationRate,
+			destinationRate,
 			config.DestinationRateThreshold,
 			nil,
 			destinationLabels,
@@ -624,12 +641,48 @@ func (config *AnalysisConfiguration) classifyGlobalBehavior(
 		eventTime,
 		globalPacketRate,
 		config.PacketRateThreshold,
-		newDestinationRate,
+		destinationRate,
 		config.DestinationRateThreshold,
 		nil,
 		destinationLabels,
 		&config.context,
 	)
+}
+
+func (config *AnalysisConfiguration) computeDestinationRate(durationSeconds float64) float64 {
+	if config == nil || durationSeconds <= 0 {
+		return 0
+	}
+
+	destinations := config.result.destinationPacketCounts
+	if len(destinations) == 0 {
+		config.previousDestinations = nil
+		return 0
+	}
+
+	mode := config.destinationRateMode
+	if mode == "" {
+		mode = DestinationRateTotal
+	}
+
+	var count int
+	if mode == DestinationRateNew {
+		for destination := range destinations {
+			if _, seen := config.previousDestinations[destination]; !seen {
+				count++
+			}
+		}
+	} else {
+		count = len(destinations)
+	}
+
+	next := make(map[Destination]struct{}, len(destinations))
+	for destination := range destinations {
+		next[destination] = struct{}{}
+	}
+	config.previousDestinations = next
+
+	return float64(count) / durationSeconds
 }
 
 func destinationLabels(destinations map[Destination]int) *[]string {

@@ -30,12 +30,14 @@ const (
 	defaultWindowSizeS           = 30
 	defaultPacketRateThresh      = 5.0
 	defaultDestinationRateThresh = 10.0
+	defaultDestinationRateMode   = "total"
 	defaultLogLevel              = "info"
 )
 
 var (
 	packetRateThreshold      = defaultPacketRateThresh
 	destinationRateThreshold = defaultDestinationRateThresh
+	destinationRateMode      = defaultDestinationRateMode
 	logLevelStr              = defaultLogLevel
 	windowSizeSeconds        = defaultWindowSizeS
 	captureDirPath           string
@@ -64,6 +66,12 @@ func init() {
 		"destination-threshold",
 		defaultDestinationRateThresh,
 		"Destination endpoint (IP/port/protocol) diversity threshold per window before flagging a scan.",
+	)
+	RootCmd.Flags().StringVar(
+		&destinationRateMode,
+		"destination-rate-mode",
+		defaultDestinationRateMode,
+		"Destination rate mode for scans: total (unique destinations in window) or new (unique destinations not seen in previous window).",
 	)
 	RootCmd.Flags().StringVar(
 		&logLevelStr,
@@ -177,6 +185,11 @@ func executeAnalysis(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	rateMode, err := parseDestinationRateMode(destinationRateMode)
+	if err != nil {
+		return err
+	}
+
 	handle, err := resolveHandle(input)
 	if err != nil {
 		return err
@@ -191,6 +204,7 @@ func executeAnalysis(cmd *cobra.Command, args []string) error {
 		eveLogPath,
 		packetRateThreshold,
 		destinationRateThreshold,
+		rateMode,
 		level,
 		sampleID,
 		savePacketsCount,
@@ -236,6 +250,22 @@ func parseLogLevel(level string) (slog.Level, error) {
 		return slog.LevelError, nil
 	default:
 		return slog.LevelInfo, fmt.Errorf("unsupported log-level %q (expected debug, info, warn, error)", level)
+	}
+}
+
+func parseDestinationRateMode(mode string) (internal.DestinationRateMode, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case string(internal.DestinationRateTotal):
+		return internal.DestinationRateTotal, nil
+	case string(internal.DestinationRateNew):
+		return internal.DestinationRateNew, nil
+	default:
+		return internal.DestinationRateTotal, fmt.Errorf(
+			"unsupported destination-rate-mode %q (expected %q or %q)",
+			mode,
+			internal.DestinationRateTotal,
+			internal.DestinationRateNew,
+		)
 	}
 }
 
@@ -337,6 +367,7 @@ func renderRuntimeConfiguration(args []string) string {
 	fmt.Fprintf(&b, "  window: %s\n", window)
 	fmt.Fprintf(&b, "  packet-threshold: %.2f\n", packetRateThreshold)
 	fmt.Fprintf(&b, "  destination-threshold: %.2f\n", destinationRateThreshold)
+	fmt.Fprintf(&b, "  destination-rate-mode: %s\n", destinationRateMode)
 	fmt.Fprintf(&b, "  log-level: %s\n", logLevelStr)
 	fmt.Fprintf(&b, "  show-idle: %t\n", showIdle)
 	fmt.Fprintf(&b, "  c2-ip: %s\n", c2Display)

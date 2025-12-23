@@ -177,6 +177,36 @@ func TestOutboundResumesAfterScanWindow(t *testing.T) {
 	}
 }
 
+func TestNewDestinationRateOnlyCountsNewAcrossWindows(t *testing.T) {
+	buf := &bytes.Buffer{}
+	config := newTestAnalysisConfigWithC2(buf, "", 100, 2)
+	config.destinationRateMode = DestinationRateNew
+
+	now := time.Now()
+
+	windowPkts := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.70", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.71", 23),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.72", 80),
+	}
+	config.ProcessBatch(nil, windowPkts, now)
+	config.flushResults()
+
+	repeatPkts := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.70", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.71", 23),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.72", 80),
+	}
+	config.ProcessBatch(nil, repeatPkts, now.Add(time.Second))
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+	scans := findEventsByCategory(events, "scan")
+	if len(scans) != 1 {
+		t.Fatalf("expected one scan event for the first window only, got %d (%v)", len(scans), events)
+	}
+}
+
 func TestAttackDestinationNotLoggedAsOutbound(t *testing.T) {
 	buf := &bytes.Buffer{}
 	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 1, 10)
@@ -286,6 +316,7 @@ func newTestAnalysisConfigWithC2(w io.Writer, c2 string, packetThresh, destinati
 		"",
 		packetThresh,
 		destinationThresh,
+		DestinationRateTotal,
 		slog.LevelError,
 		"sample-1",
 		0,
