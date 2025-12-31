@@ -404,6 +404,8 @@ func (config *AnalysisConfiguration) flushResults() {
 	if config.result.windowStart.IsZero() {
 		return
 	}
+	defer config.resetWindowState()
+
 	windowDuration := config.Window
 	if windowDuration <= 0 {
 		config.logger.Warn(
@@ -463,7 +465,19 @@ func (config *AnalysisConfiguration) flushResults() {
 		config.logBehavior(localBehavior, captured)
 	}
 
+}
+
+func (config *AnalysisConfiguration) resetWindowState() {
 	config.result = batchResult{}
+	if config.savePackets <= 0 {
+		config.buffers = nil
+		return
+	}
+	if config.buffers == nil {
+		config.buffers = make(map[string]*packetRing)
+		return
+	}
+	clear(config.buffers)
 }
 
 func (config *AnalysisConfiguration) logBehavior(
