@@ -43,7 +43,7 @@ func CaptureLoop(handle *pcap.Handle, config *AnalysisConfiguration) error {
 
 	config.logger.Debug(
 		"Initialized time-window tracking",
-		"window", config.Window,
+		"window", config.WindowSize,
 		"bufferCapacity", cap(cur),
 	)
 
@@ -99,7 +99,7 @@ func CaptureLoop(handle *pcap.Handle, config *AnalysisConfiguration) error {
 			// so we still flush when the duration elapses.
 			if windowStart.IsZero() {
 				windowStart = ts
-			} else if len(cur) > 0 && ts.Sub(windowStart) >= config.Window {
+			} else if len(cur) > 0 && ts.Sub(windowStart) >= config.WindowSize {
 				config.logger.Debug(
 					"Handing off packet batch due to elapsed window",
 					"count", len(cur),

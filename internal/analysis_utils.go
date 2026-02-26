@@ -158,7 +158,7 @@ func mergeDestinationCounts(acc destinationCounts, batch destinationCounts) dest
 // countPacketsByDestination tallies packets overall and per destination endpoint.
 func countPacketsByDestination(
 	pkts *[]gopacket.Packet,
-	excludeIPs *[]string,
+	exclude map[string]bool,
 	maxDestinations int,
 ) (int, destinationCounts, error) {
 	if pkts == nil || len(*pkts) == 0 {
@@ -167,17 +167,6 @@ func countPacketsByDestination(
 
 	hostCounts := make(destinationCounts, maxDestinations)
 	total := 0
-
-	var exclude map[string]struct{}
-	if excludeIPs != nil && len(*excludeIPs) > 0 {
-		exclude = make(map[string]struct{}, len(*excludeIPs))
-		for _, ip := range *excludeIPs {
-			if ip == "" {
-				continue
-			}
-			exclude[ip] = struct{}{}
-		}
-	}
 
 	for _, packet := range *pkts {
 		if packet == nil {
@@ -188,7 +177,7 @@ func countPacketsByDestination(
 			continue
 		}
 
-		if _, skip := exclude[destination.IP]; skip {
+		if exclude[destination.IP] {
 			continue
 		}
 

@@ -23,7 +23,7 @@ type AnalysisConfiguration struct {
 	// configuration
 	PacketRateThreshold      float64
 	DestinationRateThreshold float64
-	Window                   time.Duration
+	WindowSize               time.Duration
 	scanDetectionMode        ScanDetectionMode
 	maxDestinations          int // maximum number of destinations to analyze per window
 	calibrate                bool
@@ -41,7 +41,6 @@ type AnalysisConfiguration struct {
 
 	result            batchResult
 	buffers           map[string]*packetRing
-	ignoredIP         map[string]struct{}
 	summary           AnalysisSummary
 	captureBehavior   func(*AnalysisConfiguration, *Behavior) (bool, error)
 	previousScanHosts []Destination
@@ -117,8 +116,8 @@ type AnalysisContext struct {
 	// instance configuration
 	srcIP            string
 	c2IP             string
-	sampleID         string   // unique identifier to match behavior to a malware sample
-	uninterestingIPs []string // List of IP addresses that are not interesting for analysis
+	sampleID         string          // unique identifier to match behavior to a malware sample
+	uninterestingIPs map[string]bool // List of IP addresses that are not interesting for analysis
 }
 
 type calibrationStats struct {
@@ -234,13 +233,10 @@ func NewAnalysisConfiguration(
 
 	// source and C2 IPs should be excluded from analysis
 	filterIPs = append(filterIPs, srcIP, c2IP)
+	uninterestingIPs := map[string]bool{}
 
-	ignored := make(map[string]struct{}, len(filterIPs))
 	for _, ip := range filterIPs {
-		if ip == "" {
-			continue
-		}
-		ignored[ip] = struct{}{}
+		uninterestingIPs[ip] = true
 	}
 
 	var buffers map[string]*packetRing
@@ -263,19 +259,18 @@ func NewAnalysisConfiguration(
 		eventFile:                file,
 		PacketRateThreshold:      PacketThreshold,
 		DestinationRateThreshold: destinationThreshold,
-		Window:                   window,
+		WindowSize:               window,
 		scanDetectionMode:        scanDetectionMode,
 		calibrate:                calibrate,
 		showIdle:                 showIdle,
 		savePackets:              savePackets,
 		captureDir:               captureDir,
 		buffers:                  buffers,
-		ignoredIP:                ignored,
 		context: AnalysisContext{
 			srcIP:            srcIP,
 			c2IP:             c2IP,
 			sampleID:         sampleID,
-			uninterestingIPs: filterIPs,
+			uninterestingIPs: uninterestingIPs,
 		},
 		captureBehavior: captureBehavior,
 		maxDestinations: defaultMaxDestinations,
@@ -409,7 +404,7 @@ func (config *AnalysisConfiguration) ProcessBatch(
 	}
 	globalPacketCount, destinationPacketCounts, err := countPacketsByDestination(
 		&batch,
-		&config.context.uninterestingIPs,
+		config.context.uninterestingIPs,
 		maxTrackedDestinations,
 	)
 	if err != nil {
@@ -488,12 +483,7 @@ func (config *AnalysisConfiguration) shouldTrackHost(host string) bool {
 	if host == "" || config.savePackets <= 0 {
 		return false
 	}
-	if config.ignoredIP != nil {
-		if _, skip := config.ignoredIP[host]; skip {
-			return false
-		}
-	}
-	return true
+	return config.context.uninterestingIPs[host]
 }
 
 func (config *AnalysisConfiguration) snapshotHostPackets(host string) []gopacket.Packet {
@@ -516,11 +506,11 @@ func (config *AnalysisConfiguration) flushResults() {
 	}
 	defer config.resetWindowState()
 
-	windowDuration := config.Window
+	windowDuration := config.WindowSize
 	if windowDuration <= 0 {
 		config.logger.Warn(
 			"Unable to normalize rates due to non-positive duration",
-			"window", config.Window,
+			"window", config.WindowSize,
 		)
 		windowDuration = time.Second
 	}
