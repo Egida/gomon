@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -277,109 +276,6 @@ func NewAnalysisConfiguration(
 	}
 }
 
-type BehaviorScope string
-
-const (
-	Global BehaviorScope = "global"
-	Local  BehaviorScope = "local"
-)
-
-type BehaviorClass string // Classification of the behavior in a particular window
-
-const (
-	// local
-	Attack             BehaviorClass = "attack"              // any attacking behavior
-	OutboundConnection BehaviorClass = "outbound_connection" // normal connectivity behavior
-
-	// global
-	Scan BehaviorClass = "scanning" // any scanning behavior
-	Idle BehaviorClass = "idle"     // absence of activity
-)
-
-type Behavior struct {
-	Classification BehaviorClass `json:"classification"`
-	Scope          BehaviorScope `json:"scope"`      // Indicates the scope of the behavior (global/local)
-	Timestamp      time.Time     `json:"@timestamp"` // @timestamp to comply with Elastic
-
-	PacketRate               float64 `json:"packet_rate"`
-	PacketThreshold          float64 `json:"packet_threshold"`
-	DestinationRate          float64 `json:"destination_rate"`
-	DestinationRateThreshold float64 `json:"destination_rate_threshold"`
-
-	SampleID string  `json:"sample_id"`
-	SrcIP    *string `json:"src_ip"`
-	C2IP     *string `json:"c2_ip"`
-
-	// Destination IP/s depending on the scope
-	DstIPs      *[]string    `json:"dst_ips"`
-	DstIP       *string      `json:"dst_ip"`
-	DstPort     *uint16      `json:"dst_port,omitempty"`
-	Proto       string       `json:"proto,omitempty"`
-	Destination *Destination `json:"destination,omitempty"`
-}
-
-// NewBehavior builds a Behavior with consistent context and destination wiring.
-func NewBehavior(
-	classification BehaviorClass,
-	scope BehaviorScope,
-	eventTime time.Time,
-	packetRate float64,
-	packetThreshold float64,
-	destinationRate float64,
-	destinationRateThreshold float64,
-	destination *Destination,
-	destinationLabels *[]string,
-	context *AnalysisContext,
-) *Behavior {
-	if eventTime.IsZero() {
-		eventTime = time.Now()
-	}
-
-	b := &Behavior{
-		Classification:           classification,
-		Scope:                    scope,
-		Timestamp:                eventTime,
-		PacketRate:               packetRate,
-		PacketThreshold:          packetThreshold,
-		DestinationRate:          destinationRate,
-		DestinationRateThreshold: destinationRateThreshold,
-	}
-
-	if context != nil {
-		if context.sampleID != "" {
-			b.SampleID = context.sampleID
-		}
-		if context.srcIP != "" {
-			b.SrcIP = &context.srcIP
-		}
-		if context.c2IP != "" {
-			b.C2IP = &context.c2IP
-		}
-	}
-
-	if destination != nil {
-		destCopy := *destination
-		if destCopy.IP != "" {
-			dstIP := destCopy.IP
-			b.DstIP = &dstIP
-		}
-		if destCopy.Port > 0 {
-			port := destCopy.Port
-			b.DstPort = &port
-		}
-		if destCopy.Protocol != "" {
-			b.Proto = destCopy.Protocol
-		}
-		b.Destination = &destCopy
-	}
-
-	if destinationLabels != nil {
-		b.DstIPs = destinationLabels
-	}
-
-	return b
-}
-
 // ProcessBatch processes a (subset) of a window of packets and saves
 // intermediate results.
 func (config *AnalysisConfiguration) ProcessBatch(
@@ -523,7 +419,8 @@ func (config *AnalysisConfiguration) flushResults() {
 	}
 
 	localBehaviors := make([]*Behavior, 0, len(config.result.destinationPacketCounts))
-	attackHosts := make(map[string]struct{})
+	attacked := make(map[string]bool)
+
 	for _, entry := range config.result.destinationPacketCounts {
 		packetRate := float64(entry.Count) / durationSeconds
 		localBehavior := config.classifyLocalBehavior(packetRate, entry.Destination, config.result.windowStart)
@@ -532,13 +429,13 @@ func (config *AnalysisConfiguration) flushResults() {
 		}
 		localBehaviors = append(localBehaviors, localBehavior)
 		if localBehavior.Classification == Attack && localBehavior.DstIP != nil {
-			attackHosts[*localBehavior.DstIP] = struct{}{}
+			attacked[*localBehavior.DstIP] = true
 		}
 	}
 
 	scanCounts := config.result.destinationPacketCounts
 	if config.scanDetectionMode == ScanDetectionFilteredHostRate {
-		scanCounts = config.filterNonAttackingDestinations(scanCounts, attackHosts)
+		scanCounts = config.filterNonAttackingDestinations(scanCounts, attacked)
 	}
 	scanDestinations := destinationsFromCounts(scanCounts)
 	scanHosts := uniqueHosts(scanDestinations)
@@ -557,7 +454,7 @@ func (config *AnalysisConfiguration) flushResults() {
 		"destinationPacketCounts", config.result.destinationPacketCounts,
 		"windowDestinationCount", len(config.result.destinationPacketCounts),
 		"scanDetectionMode", config.scanDetectionMode,
-		"attackHostCount", len(attackHosts),
+		"attackHostCount", len(attacked),
 		"scanHostCount", len(scanHosts),
 		"scanTargetCount", len(scanTargets),
 	)
@@ -626,7 +523,8 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 	globalPacketRate := float64(config.result.globalPacketCount) / durationSeconds
 	destinations := config.result.destinationPacketCounts
 
-	attackHosts := make(map[string]struct{})
+	attacked := make(map[string]bool)
+
 	if config.context.c2IP != "" && config.PacketRateThreshold > 0 {
 		for _, entry := range destinations {
 			if entry.Destination.IP == "" {
@@ -634,14 +532,14 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 			}
 			packetRate := float64(entry.Count) / durationSeconds
 			if packetRate > config.PacketRateThreshold {
-				attackHosts[entry.Destination.IP] = struct{}{}
+				attacked[entry.Destination.IP] = true
 			}
 		}
 	}
 
 	scanCounts := destinations
 	if config.scanDetectionMode == ScanDetectionFilteredHostRate {
-		scanCounts = config.filterNonAttackingDestinations(scanCounts, attackHosts)
+		scanCounts = config.filterNonAttackingDestinations(scanCounts, attacked)
 	}
 
 	scanHosts := uniqueHosts(destinationsFromCounts(scanCounts))
@@ -892,137 +790,23 @@ func (config *AnalysisConfiguration) classifyGlobalBehavior(
 	)
 }
 
-func (config *AnalysisConfiguration) filterNonAttackingDestinations(destinations destinationCounts, attackHosts map[string]struct{}) destinationCounts {
-	if len(destinations) == 0 {
-		return nil
-	}
-	if len(attackHosts) == 0 {
+func (config *AnalysisConfiguration) filterNonAttackingDestinations(
+	destinations destinationCounts,
+	attacked map[string]bool,
+) destinationCounts {
+	if len(destinations) == 0 || len(attacked) == 0 {
 		return destinations
 	}
 
 	filtered := make(destinationCounts, len(destinations))
-	for key, entry := range destinations {
-		if entry.Destination.IP == "" {
-			continue
-		}
-		if _, isAttackHost := attackHosts[entry.Destination.IP]; isAttackHost {
-			continue
-		}
-		filtered[key] = entry
-	}
 
-	if len(filtered) == 0 {
-		return nil
+	for key, entry := range destinations {
+		if !attacked[entry.Destination.IP] {
+			filtered[key] = entry
+		}
 	}
 
 	return filtered
-}
-
-func destinationsFromCounts(destinations destinationCounts) []Destination {
-	if len(destinations) == 0 {
-		return nil
-	}
-
-	list := make([]Destination, 0, len(destinations))
-	for _, entry := range destinations {
-		if entry.Destination.IP == "" {
-			continue
-		}
-		list = append(list, entry.Destination)
-	}
-
-	if len(list) == 0 {
-		return nil
-	}
-
-	return list
-}
-
-func uniqueHosts(destinations []Destination) []Destination {
-	if len(destinations) == 0 {
-		return nil
-	}
-
-	hosts := make([]Destination, 0, len(destinations))
-	for _, destination := range destinations {
-		if destination.IP == "" {
-			continue
-		}
-		seen := false
-		for _, host := range hosts {
-			if destination.HostEquals(host) {
-				seen = true
-				break
-			}
-		}
-		if !seen {
-			hosts = append(hosts, destination)
-		}
-	}
-
-	if len(hosts) == 0 {
-		return nil
-	}
-
-	return hosts
-}
-
-func newHosts(current []Destination, previous []Destination) []Destination {
-	if len(current) == 0 {
-		return nil
-	}
-	if len(previous) == 0 {
-		return current
-	}
-
-	var out []Destination
-	for _, destination := range current {
-		seen := false
-		for _, prev := range previous {
-			if destination.HostEquals(prev) {
-				seen = true
-				break
-			}
-		}
-		if !seen {
-			out = append(out, destination)
-		}
-	}
-
-	if len(out) == 0 {
-		return nil
-	}
-
-	return out
-}
-
-func computeScanRate(durationSeconds float64, hostCount int) float64 {
-	if durationSeconds <= 0 || hostCount <= 0 {
-		return 0
-	}
-
-	return float64(hostCount) / durationSeconds
-}
-
-func hostLabels(hosts []Destination) *[]string {
-	if len(hosts) == 0 {
-		return nil
-	}
-
-	labels := make([]string, 0, len(hosts))
-	for _, host := range hosts {
-		if host.IP == "" {
-			continue
-		}
-		labels = append(labels, host.IP)
-	}
-
-	if len(labels) == 0 {
-		return nil
-	}
-
-	sort.Strings(labels)
-	return &labels
 }
 
 func (config *AnalysisConfiguration) Close() error {

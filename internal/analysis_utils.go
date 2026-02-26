@@ -2,6 +2,7 @@ package internal
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -260,4 +261,108 @@ func getEventTime(
 	}
 
 	return eventTime
+}
+
+func destinationsFromCounts(destinations destinationCounts) []Destination {
+	if len(destinations) == 0 {
+		return nil
+	}
+
+	list := make([]Destination, 0, len(destinations))
+
+	for _, entry := range destinations {
+		if entry.Destination.IP == "" {
+			continue
+		}
+		list = append(list, entry.Destination)
+	}
+
+	return list
+}
+
+func uniqueHosts(destinations []Destination) []Destination {
+	if len(destinations) == 0 {
+		return nil
+	}
+
+	hosts := make([]Destination, 0, len(destinations))
+	for _, destination := range destinations {
+		if destination.IP == "" {
+			continue
+		}
+		seen := false
+		for _, host := range hosts {
+			if destination.HostEquals(host) {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			hosts = append(hosts, destination)
+		}
+	}
+
+	if len(hosts) == 0 {
+		return nil
+	}
+
+	return hosts
+}
+
+func newHosts(current []Destination, previous []Destination) []Destination {
+	if len(current) == 0 {
+		return nil
+	}
+	if len(previous) == 0 {
+		return current
+	}
+
+	var out []Destination
+	for _, destination := range current {
+		seen := false
+		for _, prev := range previous {
+			if destination.HostEquals(prev) {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			out = append(out, destination)
+		}
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+
+	return out
+}
+
+func computeScanRate(durationSeconds float64, hostCount int) float64 {
+	if durationSeconds <= 0 || hostCount <= 0 {
+		return 0
+	}
+
+	return float64(hostCount) / durationSeconds
+}
+
+func hostLabels(hosts []Destination) *[]string {
+	if len(hosts) == 0 {
+		return nil
+	}
+
+	labels := make([]string, 0, len(hosts))
+	for _, host := range hosts {
+		if host.IP == "" {
+			continue
+		}
+		labels = append(labels, host.IP)
+	}
+
+	if len(labels) == 0 {
+		return nil
+	}
+
+	sort.Strings(labels)
+	return &labels
 }
