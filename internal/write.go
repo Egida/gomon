@@ -28,7 +28,7 @@ func sanitizeFileComponent(value string) string {
 	return fileComponentSanitizer.Replace(value)
 }
 
-func BuildCapturePath(baseDir string, behavior *Behavior) (string, error) {
+func BuildCapturePath(baseDir string, behavior *LocalBehavior) (string, error) {
 	if behavior == nil {
 		return "", errors.New("behavior is nil")
 	}
@@ -44,11 +44,14 @@ func BuildCapturePath(baseDir string, behavior *Behavior) (string, error) {
 	}
 
 	hostComponent := sanitizeFileComponent("global")
-	if behavior.DstIP != nil && *behavior.DstIP != "" {
-		hostComponent = sanitizeFileComponent(*behavior.DstIP)
+	if behavior.Flow.DstHost != 0 {
+		hostComponent = sanitizeFileComponent(behavior.Flow.DstHost.String())
 	}
 
-	sampleComponent := sanitizeFileComponent(behavior.SampleID)
+	sampleComponent := ""
+	if behavior.context != nil {
+		sampleComponent = sanitizeFileComponent(behavior.context.sampleID)
+	}
 	timeComponent := ts.UTC().Format("20060102T150405Z")
 
 	parts := []string{classComponent}
@@ -148,7 +151,7 @@ func WritePackets(filename string, packets []gopacket.Packet, linkType layers.Li
 
 func WriteBehaviorCapture(
 	baseDir string,
-	behavior *Behavior,
+	behavior *LocalBehavior,
 	packets []gopacket.Packet,
 	linkType layers.LinkType,
 ) (string, error) {

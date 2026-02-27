@@ -2,115 +2,10 @@ package internal
 
 import (
 	"encoding/binary"
-	"net/netip"
-	"sort"
 	"strings"
-	"time"
 
 	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
 )
-
-type MaxFlowsReached struct{}
-
-func (e *MaxFlowsReached) Error() string {
-	return "maximum number of flows reached"
-}
-
-type Host uint32
-
-func (h Host) String() string {
-	var octets [4]byte
-	binary.BigEndian.PutUint32(octets[:], uint32(h))
-	return netip.AddrFrom4(octets).String()
-}
-
-func hostKeyFromIPv4String(ip string) (Host, bool) {
-	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
-	if err != nil || !addr.Is4() {
-		return 0, false
-	}
-	octets := addr.As4()
-	return Host(binary.BigEndian.Uint32(octets[:])), true
-}
-
-func hostKeyFromEndpoint(endpoint gopacket.Endpoint) (Host, bool) {
-	raw := endpoint.Raw()
-	if len(raw) != 4 {
-		return 0, false
-	}
-	return Host(binary.BigEndian.Uint32(raw)), true
-}
-
-// Flow identifies a packet flow key using gopacket network and transport flows.
-type Flow struct {
-	NetworkFlow   gopacket.Flow
-	TransportFlow gopacket.Flow
-}
-
-func (f Flow) Equals(other Flow) bool {
-	return f.NetworkFlow == other.NetworkFlow && f.TransportFlow == other.TransportFlow
-}
-
-func flowFromPacket(packet gopacket.Packet) (Flow, bool) {
-	if packet == nil {
-		return Flow{}, false
-	}
-
-	network := packet.NetworkLayer()
-	if network == nil {
-		return Flow{}, false
-	}
-
-	key := Flow{
-		NetworkFlow: network.NetworkFlow(),
-	}
-
-	transport := packet.TransportLayer()
-	if transport != nil {
-		switch transport.(type) {
-		case *layers.TCP, *layers.UDP:
-			key.TransportFlow = transport.TransportFlow()
-		}
-	}
-
-	return key, true
-}
-
-type flowCounts map[Flow]int
-
-func topFlowByCount(flows flowCounts) (BehaviorFlow, int) {
-	if len(flows) == 0 {
-		return BehaviorFlow{}, 0
-	}
-
-	var (
-		maxFlow  BehaviorFlow
-		maxCount int
-		maxLabel string
-		found    bool
-	)
-
-	for flow, count := range flows {
-		if count <= 0 {
-			continue
-		}
-		behaviorFlow := behaviorFlowFromFlow(flow)
-		label := behaviorFlow.String()
-		if !found || count > maxCount || (count == maxCount && label < maxLabel) {
-			maxCount = count
-			maxFlow = behaviorFlow
-			maxLabel = label
-			found = true
-		}
-	}
-
-	if !found {
-		return BehaviorFlow{}, 0
-	}
-
-	return maxFlow, maxCount
-}
 
 type packetRing struct {
 	max   int
@@ -167,20 +62,20 @@ func mergeFlowCounts(acc flowCounts, batch flowCounts) flowCounts {
 	return acc
 }
 
-// countPacketsByFlow tallies packets overall and per flow endpoint.
+// countPacketsByFlow tallies packets overall and per flow.
 func countPacketsByFlow(
-	pkts *[]gopacket.Packet,
+	packets *[]gopacket.Packet,
 	exclude map[Host]bool,
 	maxFlows int,
 ) (int, flowCounts, error) {
-	if pkts == nil || len(*pkts) == 0 {
+	if packets == nil || len(*packets) == 0 {
 		return 0, nil, nil
 	}
 
 	hostCounts := make(flowCounts, maxFlows)
 	total := 0
 
-	for _, packet := range *pkts {
+	for _, packet := range *packets {
 		if packet == nil {
 			continue
 		}
@@ -190,11 +85,11 @@ func countPacketsByFlow(
 		}
 
 		behaviorFlow := behaviorFlowFromFlow(key)
-		if !behaviorFlow.HasDstHost {
+		if behaviorFlow.DstHost == 0 {
 			continue
 		}
 
-		if behaviorFlow.HasDstHost && exclude[behaviorFlow.DstHost] {
+		if exclude[behaviorFlow.DstHost] {
 			continue
 		}
 
@@ -221,13 +116,11 @@ func behaviorFlowFromFlow(flow Flow) BehaviorFlow {
 	src := flow.NetworkFlow.Src()
 	dst := flow.NetworkFlow.Dst()
 
-	if srcHost, ok := hostKeyFromEndpoint(src); ok {
+	if srcHost, ok := hostFromEndpoint(src); ok {
 		out.SrcHost = srcHost
-		out.HasSrcHost = true
 	}
-	if dstHost, ok := hostKeyFromEndpoint(dst); ok {
+	if dstHost, ok := hostFromEndpoint(dst); ok {
 		out.DstHost = dstHost
-		out.HasDstHost = true
 	}
 
 	if srcPort, ok := portFromEndpoint(flow.TransportFlow.Src()); ok {
@@ -267,28 +160,6 @@ func protocolFromFlow(flow Flow) string {
 	return ""
 }
 
-// getEventTime returns the timestamp of the start of the window, or of the
-// first packet in the batch or filtered batch, or the current time if no
-// packets are available.
-func getEventTime(
-	windowStart time.Time,
-	batch *[]gopacket.Packet,
-) time.Time {
-	eventTime := windowStart
-
-	if eventTime.IsZero() {
-		if batch != nil && len(*batch) > 0 {
-			if md := (*batch)[0].Metadata(); md != nil {
-				eventTime = md.Timestamp
-			}
-		} else {
-			eventTime = time.Now()
-		}
-	}
-
-	return eventTime
-}
-
 func flowsFromCounts(flows flowCounts) []BehaviorFlow {
 	if len(flows) == 0 {
 		return nil
@@ -298,7 +169,7 @@ func flowsFromCounts(flows flowCounts) []BehaviorFlow {
 
 	for flow := range flows {
 		behaviorFlow := behaviorFlowFromFlow(flow)
-		if !behaviorFlow.HasDstHost {
+		if behaviorFlow.DstHost == 0 {
 			continue
 		}
 		list = append(list, behaviorFlow)
@@ -315,7 +186,7 @@ func uniqueHosts(flows []BehaviorFlow) []BehaviorFlow {
 	hosts := make([]BehaviorFlow, 0, len(flows))
 	seenHosts := make(map[Host]struct{}, len(flows))
 	for _, flow := range flows {
-		if !flow.HasDstHost {
+		if flow.DstHost == 0 {
 			continue
 		}
 		if _, exists := seenHosts[flow.DstHost]; exists {
@@ -342,14 +213,14 @@ func newHosts(current []BehaviorFlow, previous []BehaviorFlow) []BehaviorFlow {
 
 	seenHosts := make(map[Host]struct{}, len(previous))
 	for _, prev := range previous {
-		if prev.HasDstHost {
+		if prev.DstHost != 0 {
 			seenHosts[prev.DstHost] = struct{}{}
 		}
 	}
 
 	var out []BehaviorFlow
 	for _, flow := range current {
-		if flow.HasDstHost {
+		if flow.DstHost != 0 {
 			if _, exists := seenHosts[flow.DstHost]; exists {
 				continue
 			}
@@ -370,25 +241,4 @@ func computeScanRate(durationSeconds float64, hostCount int) float64 {
 	}
 
 	return float64(hostCount) / durationSeconds
-}
-
-func hostLabels(hosts []BehaviorFlow) *[]string {
-	if len(hosts) == 0 {
-		return nil
-	}
-
-	labels := make([]string, 0, len(hosts))
-	for _, host := range hosts {
-		if !host.HasDstHost {
-			continue
-		}
-		labels = append(labels, host.DstHost.String())
-	}
-
-	if len(labels) == 0 {
-		return nil
-	}
-
-	sort.Strings(labels)
-	return &labels
 }

@@ -27,25 +27,20 @@ const (
 
 // BehaviorFlow identifies packet endpoint details used for local behavior events.
 type BehaviorFlow struct {
-	SrcPort    uint16 `json:"src_port,omitempty"`
-	DstPort    uint16 `json:"port,omitempty"`
-	Protocol   string `json:"protocol,omitempty"`
-	SrcHost    Host   `json:"-"`
-	DstHost    Host   `json:"-"`
-	HasSrcHost bool   `json:"-"`
-	HasDstHost bool   `json:"-"`
+	SrcPort  uint16 `json:"src_port,omitempty"`
+	DstPort  uint16 `json:"port,omitempty"`
+	Protocol string `json:"protocol,omitempty"`
+	SrcHost  Host   `json:"src_host,omitempty"`
+	DstHost  Host   `json:"dst_host,omitempty"`
 }
 
 // Equals returns true when two behavior flows represent the same 5-tuple
 // (source host/port, destination host/port, protocol).
 func (f BehaviorFlow) Equals(other BehaviorFlow) bool {
-	if f.HasSrcHost != other.HasSrcHost || f.HasDstHost != other.HasDstHost {
+	if f.SrcHost != other.SrcHost {
 		return false
 	}
-	if f.HasSrcHost && f.SrcHost != other.SrcHost {
-		return false
-	}
-	if f.HasDstHost && f.DstHost != other.DstHost {
+	if f.DstHost != other.DstHost {
 		return false
 	}
 	return f.SrcPort == other.SrcPort &&
@@ -55,7 +50,7 @@ func (f BehaviorFlow) Equals(other BehaviorFlow) bool {
 
 // HostEquals returns true when the behavior flows share the same destination host.
 func (f BehaviorFlow) HostEquals(other BehaviorFlow) bool {
-	if f.HasDstHost && other.HasDstHost {
+	if f.DstHost != 0 && other.DstHost != 0 {
 		return f.DstHost == other.DstHost
 	}
 	return false
@@ -64,7 +59,7 @@ func (f BehaviorFlow) HostEquals(other BehaviorFlow) bool {
 // String renders a human-readable endpoint label.
 func (f BehaviorFlow) String() string {
 	base := ""
-	if f.HasDstHost {
+	if f.DstHost != 0 {
 		base = f.DstHost.String()
 	}
 	if f.DstPort > 0 {
@@ -76,7 +71,7 @@ func (f BehaviorFlow) String() string {
 	return base
 }
 
-type Behavior struct {
+type behaviorBase struct {
 	Classification BehaviorClass `json:"classification"`
 	Scope          BehaviorScope `json:"scope"`      // Indicates the scope of the behavior (global/local)
 	Timestamp      time.Time     `json:"@timestamp"` // @timestamp to comply with Elastic
@@ -86,21 +81,27 @@ type Behavior struct {
 	DestinationRate          float64 `json:"destination_rate"`
 	DestinationRateThreshold float64 `json:"destination_rate_threshold"`
 
-	SampleID string  `json:"sample_id"`
-	SrcIP    *string `json:"src_ip"`
-	SrcPort  *uint16 `json:"src_port,omitempty"`
-	C2IP     *string `json:"c2_ip"`
-
-	// Flow IP/s depending on the scope
-	DstIPs  *[]string     `json:"dst_ips"`
-	DstIP   *string       `json:"dst_ip"`
-	DstPort *uint16       `json:"dst_port,omitempty"`
-	Proto   string        `json:"proto,omitempty"`
-	Flow    *BehaviorFlow `json:"flow,omitempty"`
+	Context *BehaviorContext `json:"context,omitempty"`
+	context *AnalysisContext `json:"-"`
 }
 
-// NewBehavior builds a Behavior with consistent context and flow wiring.
-func NewBehavior(
+type BehaviorContext struct {
+	SampleID string  `json:"sample_id,omitempty"`
+	SrcIP    *string `json:"src_ip,omitempty"`
+	C2IP     *string `json:"c2_ip,omitempty"`
+}
+
+type LocalBehavior struct {
+	behaviorBase
+	Flow BehaviorFlow `json:"flow"`
+}
+
+type GlobalBehavior struct {
+	behaviorBase
+	Flows []BehaviorFlow `json:"flows,omitempty"`
+}
+
+func newBehaviorBase(
 	classification BehaviorClass,
 	scope BehaviorScope,
 	eventTime time.Time,
@@ -108,15 +109,13 @@ func NewBehavior(
 	packetThreshold float64,
 	destinationRate float64,
 	destinationRateThreshold float64,
-	flow *BehaviorFlow,
-	destinationLabels *[]string,
 	context *AnalysisContext,
-) *Behavior {
+) behaviorBase {
 	if eventTime.IsZero() {
 		eventTime = time.Now()
 	}
 
-	b := &Behavior{
+	base := behaviorBase{
 		Classification:           classification,
 		Scope:                    scope,
 		Timestamp:                eventTime,
@@ -124,49 +123,82 @@ func NewBehavior(
 		PacketThreshold:          packetThreshold,
 		DestinationRate:          destinationRate,
 		DestinationRateThreshold: destinationRateThreshold,
+		context:                  context,
 	}
 
 	if context != nil {
-		if context.sampleID != "" {
-			b.SampleID = context.sampleID
+		ctx := &BehaviorContext{
+			SampleID: context.sampleID,
 		}
-		if context.hasSrcHost {
-			srcIP := context.srcHost.String()
-			b.SrcIP = &srcIP
+		if context.srcHost != 0 {
+			src := context.srcHost.String()
+			ctx.SrcIP = &src
 		}
 		if context.hasC2Host {
-			c2IP := context.c2Host.String()
-			b.C2IP = &c2IP
+			c2 := context.c2Host.String()
+			ctx.C2IP = &c2
 		}
+		base.Context = ctx
 	}
 
-	if flow != nil {
-		destCopy := *flow
-		if destCopy.HasSrcHost {
-			srcIP := destCopy.SrcHost.String()
-			b.SrcIP = &srcIP
-		}
-		if destCopy.SrcPort > 0 {
-			srcPort := destCopy.SrcPort
-			b.SrcPort = &srcPort
-		}
-		if destCopy.HasDstHost {
-			dstIP := destCopy.DstHost.String()
-			b.DstIP = &dstIP
-		}
-		if destCopy.DstPort > 0 {
-			port := destCopy.DstPort
-			b.DstPort = &port
-		}
-		if destCopy.Protocol != "" {
-			b.Proto = destCopy.Protocol
-		}
-		b.Flow = &destCopy
+	return base
+}
+
+func NewLocalBehavior(
+	classification BehaviorClass,
+	eventTime time.Time,
+	packetRate float64,
+	packetThreshold float64,
+	flow BehaviorFlow,
+	context *AnalysisContext,
+) *LocalBehavior {
+	base := newBehaviorBase(
+		classification,
+		Local,
+		eventTime,
+		packetRate,
+		packetThreshold,
+		0,
+		0,
+		context,
+	)
+
+	flowCopy := flow
+	return &LocalBehavior{
+		behaviorBase: base,
+		Flow:         flowCopy,
+	}
+}
+
+func NewGlobalBehavior(
+	classification BehaviorClass,
+	eventTime time.Time,
+	packetRate float64,
+	packetThreshold float64,
+	destinationRate float64,
+	destinationRateThreshold float64,
+	flows []BehaviorFlow,
+	context *AnalysisContext,
+) *GlobalBehavior {
+	base := newBehaviorBase(
+		classification,
+		Global,
+		eventTime,
+		packetRate,
+		packetThreshold,
+		destinationRate,
+		destinationRateThreshold,
+		context,
+	)
+
+	if len(flows) == 0 {
+		return &GlobalBehavior{behaviorBase: base}
 	}
 
-	if destinationLabels != nil {
-		b.DstIPs = destinationLabels
+	out := make([]BehaviorFlow, len(flows))
+	copy(out, flows)
+	return &GlobalBehavior{
+		behaviorBase: base,
+		Flows:        out,
 	}
-
-	return b
 }

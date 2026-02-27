@@ -56,100 +56,122 @@ type EveFlowStats struct {
 
 // EveDetails keeps gomon specific metadata grouped under a dedicated object.
 type EveDetails struct {
-	Scope                    BehaviorScope `json:"scope,omitempty"`
-	C2IP                     *string       `json:"c2_ip,omitempty"` // easier handling of nil values from behavior
-	SrcPort                  *uint16       `json:"src_port,omitempty"`
-	PacketRate               float64       `json:"packet_rate,omitempty"`
-	PacketThreshold          float64       `json:"packet_threshold,omitempty"`
-	DestinationRate          float64       `json:"destination_rate,omitempty"`
-	DestinationRateThreshold float64       `json:"destination_rate_threshold,omitempty"`
-	DestPort                 *uint16       `json:"dest_port,omitempty"`
-	Proto                    string        `json:"proto,omitempty"`
+	Scope                    BehaviorScope    `json:"scope,omitempty"`
+	C2IP                     *string          `json:"c2_ip,omitempty"`
+	Context                  *BehaviorContext `json:"context,omitempty"`
+	SrcPort                  *uint16          `json:"src_port,omitempty"`
+	PacketRate               float64          `json:"packet_rate,omitempty"`
+	PacketThreshold          float64          `json:"packet_threshold,omitempty"`
+	DestinationRate          float64          `json:"destination_rate,omitempty"`
+	DestinationRateThreshold float64          `json:"destination_rate_threshold,omitempty"`
+	DestPort                 *uint16          `json:"dest_port,omitempty"`
+	Proto                    string           `json:"proto,omitempty"`
 }
 
 func NewEveLogger(w io.Writer) *EveLogger {
 	encoder := json.NewEncoder(w)
 	encoder.SetEscapeHTML(false)
-	return &EveLogger{
-		encoder: encoder,
-	}
+	return &EveLogger{encoder: encoder}
 }
 
-func (l *EveLogger) LogBehavior(behavior *Behavior) error {
+func (l *EveLogger) LogLocalBehavior(behavior *LocalBehavior) error {
 	if l == nil || behavior == nil {
 		return nil
 	}
-
-	event := behaviorToEveEvent(behavior)
+	event := localBehaviorToEveEvent(behavior)
 	if event == nil {
 		return nil
 	}
-
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
 	return l.encoder.Encode(event)
 }
 
-func behaviorToEveEvent(behavior *Behavior) *EveEvent {
-	if behavior == nil {
+func (l *EveLogger) LogGlobalBehavior(behavior *GlobalBehavior) error {
+	if l == nil || behavior == nil {
 		return nil
 	}
+	event := globalBehaviorToEveEvent(behavior)
+	if event == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.encoder.Encode(event)
+}
 
-	event := &EveEvent{
-		EventType: eventTypeFromBehavior(behavior),
-		FlowID:    flowIDFromBehavior(behavior),
-		Alert:     newEveAlertFromBehavior(behavior),
-		Stats:     newEveStats(behavior),
-		Metadata:  eventMetadataFromBehavior(behavior),
-	}
+func localBehaviorToEveEvent(behavior *LocalBehavior) *EveEvent {
+	base := &behavior.behaviorBase
+	event := baseToEvent(base)
+	event.FlowID = flowIDFromLocalBehavior(behavior)
+	event.Alert = newEveAlert(base.Classification)
+	event.Stats = newEveStats(base)
+	event.Metadata = eventMetadataFromLocalBehavior(behavior)
 
-	timestamp := behavior.Timestamp
-	if timestamp.IsZero() {
-		timestamp = time.Now()
+	if behavior.Flow.DstHost != 0 {
+		event.DestIP = behavior.Flow.DstHost.String()
 	}
-	event.Timestamp = timestamp.UTC().Format(eveTimestampFormat)
-
-	if behavior.SrcIP != nil {
-		event.SrcIP = *behavior.SrcIP
+	if behavior.Flow.SrcHost != 0 {
+		event.SrcIP = behavior.Flow.SrcHost.String()
 	}
-	if behavior.SrcPort != nil {
-		event.SrcPort = *behavior.SrcPort
+	if behavior.Flow.SrcPort > 0 {
+		event.SrcPort = behavior.Flow.SrcPort
 	}
-	if behavior.SampleID != "" {
-		event.Host = behavior.SampleID
+	if behavior.Flow.DstPort > 0 {
+		event.DestPort = behavior.Flow.DstPort
 	}
-
-	if behavior.DstIP != nil && *behavior.DstIP != "" {
-		event.DestIP = *behavior.DstIP
+	if behavior.Flow.Protocol != "" {
+		event.Proto = behavior.Flow.Protocol
 	}
-
-	if event.DestIP == "" && behavior.DstIPs != nil {
-		switch len(*behavior.DstIPs) {
-		case 0:
-		case 1:
-			event.DestIP = (*behavior.DstIPs)[0]
-		default:
-			event.DestIP = "0.0.0.0"
-		}
-	}
-
 	if event.DestIP == "" {
 		event.DestIP = "0.0.0.0"
 	}
-
-	if behavior.DstPort != nil {
-		event.DestPort = *behavior.DstPort
-	}
-	if behavior.Proto != "" {
-		event.Proto = behavior.Proto
-	}
-
 	return event
 }
 
-func eventTypeFromBehavior(behavior *Behavior) string {
-	switch behavior.Classification {
+func globalBehaviorToEveEvent(behavior *GlobalBehavior) *EveEvent {
+	base := &behavior.behaviorBase
+	event := baseToEvent(base)
+	event.FlowID = flowIDFromGlobalBehavior(behavior)
+	event.Alert = newEveAlert(base.Classification)
+	event.Stats = newEveStats(base)
+	event.Metadata = eventMetadataFromGlobalBehavior(behavior)
+
+	switch len(behavior.Flows) {
+	case 0:
+		event.DestIP = "0.0.0.0"
+	case 1:
+		if behavior.Flows[0].DstHost != 0 {
+			event.DestIP = behavior.Flows[0].DstHost.String()
+		} else {
+			event.DestIP = "0.0.0.0"
+		}
+	default:
+		event.DestIP = "0.0.0.0"
+	}
+	return event
+}
+
+func baseToEvent(base *behaviorBase) *EveEvent {
+	event := &EveEvent{
+		EventType: eventTypeFromClass(base.Classification),
+	}
+	ts := base.Timestamp
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	event.Timestamp = ts.UTC().Format(eveTimestampFormat)
+	if base.context != nil && base.context.srcHost != 0 {
+		event.SrcIP = base.context.srcHost.String()
+	}
+	if base.context != nil && base.context.sampleID != "" {
+		event.Host = base.context.sampleID
+	}
+	return event
+}
+
+func eventTypeFromClass(class BehaviorClass) string {
+	switch class {
 	case Attack, Scan, OutboundConnection:
 		return "alert"
 	default:
@@ -157,79 +179,88 @@ func eventTypeFromBehavior(behavior *Behavior) string {
 	}
 }
 
-func newEveAlertFromBehavior(behavior *Behavior) *EveAlert {
-	switch behavior.Classification {
+func newEveAlert(class BehaviorClass) *EveAlert {
+	switch class {
 	case Attack, Scan, OutboundConnection:
 	default:
 		return nil
 	}
-
 	return &EveAlert{
 		Action:      "allowed",
-		GID:         5, // GID for `gomon` alerts to allow proper categorization
-		SignatureID: signatureIDForBehavior(behavior.Classification),
+		GID:         5,
+		SignatureID: signatureIDForBehavior(class),
 		Rev:         1,
-		Signature:   signatureForBehavior(behavior),
-		Category:    categoryForBehavior(behavior.Classification),
-		Severity:    severityForBehavior(behavior.Classification),
+		Signature:   signatureForBehavior(class),
+		Category:    categoryForBehavior(class),
+		Severity:    severityForBehavior(class),
 	}
 }
 
-func newEveStats(behavior *Behavior) *EveStats {
-	if behavior == nil || behavior.Classification != Idle {
+func newEveStats(base *behaviorBase) *EveStats {
+	if base == nil || base.Classification != Idle {
 		return nil
 	}
-
 	return &EveStats{
 		Flow: &EveFlowStats{
-			PacketRate:               behavior.PacketRate,
-			PacketThreshold:          behavior.PacketThreshold,
-			DestinationRate:          behavior.DestinationRate,
-			DestinationRateThreshold: behavior.DestinationRateThreshold,
+			PacketRate:               base.PacketRate,
+			PacketThreshold:          base.PacketThreshold,
+			DestinationRate:          base.DestinationRate,
+			DestinationRateThreshold: base.DestinationRateThreshold,
 		},
 	}
 }
 
-func newEveDetails(behavior *Behavior) *EveDetails {
+func eventMetadataFromLocalBehavior(behavior *LocalBehavior) map[string]any {
 	if behavior == nil {
 		return nil
 	}
-
+	base := &behavior.behaviorBase
 	d := &EveDetails{
-		Scope:                    behavior.Scope,
-		C2IP:                     behavior.C2IP,
-		SrcPort:                  behavior.SrcPort,
-		PacketRate:               behavior.PacketRate,
-		PacketThreshold:          behavior.PacketThreshold,
-		DestinationRate:          behavior.DestinationRate,
-		DestinationRateThreshold: behavior.DestinationRateThreshold,
-		DestPort:                 behavior.DstPort,
-		Proto:                    behavior.Proto,
+		Scope:                    base.Scope,
+		Context:                  base.Context,
+		PacketRate:               base.PacketRate,
+		PacketThreshold:          base.PacketThreshold,
+		DestinationRate:          base.DestinationRate,
+		DestinationRateThreshold: base.DestinationRateThreshold,
+		Proto:                    behavior.Flow.Protocol,
 	}
-
-	return d
+	if base.context != nil && base.context.hasC2Host {
+		c2 := base.context.c2Host.String()
+		d.C2IP = &c2
+	}
+	if behavior.Flow.SrcPort > 0 {
+		srcPort := behavior.Flow.SrcPort
+		d.SrcPort = &srcPort
+	}
+	if behavior.Flow.DstPort > 0 {
+		port := behavior.Flow.DstPort
+		d.DestPort = &port
+	}
+	return map[string]any{"gomon": d}
 }
 
-func eventMetadataFromBehavior(behavior *Behavior) map[string]any {
+func eventMetadataFromGlobalBehavior(behavior *GlobalBehavior) map[string]any {
 	if behavior == nil {
 		return nil
 	}
-
-	meta := make(map[string]any)
-
-	if details := newEveDetails(behavior); details != nil {
-		meta["gomon"] = details
+	base := &behavior.behaviorBase
+	d := &EveDetails{
+		Scope:                    base.Scope,
+		Context:                  base.Context,
+		PacketRate:               base.PacketRate,
+		PacketThreshold:          base.PacketThreshold,
+		DestinationRate:          base.DestinationRate,
+		DestinationRateThreshold: base.DestinationRateThreshold,
 	}
-
-	if len(meta) == 0 {
-		return nil
+	if base.context != nil && base.context.hasC2Host {
+		c2 := base.context.c2Host.String()
+		d.C2IP = &c2
 	}
-
-	return meta
+	return map[string]any{"gomon": d}
 }
 
-func signatureForBehavior(behavior *Behavior) string {
-	switch behavior.Classification {
+func signatureForBehavior(class BehaviorClass) string {
+	switch class {
 	case Attack:
 		return "gomon high packet-rate to single host"
 	case Scan:
@@ -280,9 +311,8 @@ func signatureIDForBehavior(class BehaviorClass) int {
 	}
 }
 
-func flowIDFromBehavior(behavior *Behavior) uint64 {
+func flowIDFromLocalBehavior(behavior *LocalBehavior) uint64 {
 	hasher := fnv.New64a()
-
 	add := func(value string) {
 		if value == "" {
 			return
@@ -290,35 +320,46 @@ func flowIDFromBehavior(behavior *Behavior) uint64 {
 		_, _ = hasher.Write([]byte(value))
 	}
 
-	add(string(behavior.Classification))
-	add(string(behavior.Scope))
+	base := &behavior.behaviorBase
+	add(string(base.Classification))
+	add(string(base.Scope))
+	if behavior.Flow.SrcHost != 0 {
+		add(behavior.Flow.SrcHost.String())
+	}
+	if behavior.Flow.SrcPort > 0 {
+		add(fmt.Sprintf("%d", behavior.Flow.SrcPort))
+	}
+	if behavior.Flow.DstHost != 0 {
+		add(behavior.Flow.DstHost.String())
+	}
+	if behavior.Flow.DstPort > 0 {
+		add(fmt.Sprintf("%d", behavior.Flow.DstPort))
+	}
+	add(behavior.Flow.Protocol)
+	add(base.Timestamp.UTC().Format(time.RFC3339Nano))
+	return hasher.Sum64()
+}
 
-	if behavior.SrcIP != nil {
-		add(*behavior.SrcIP)
+func flowIDFromGlobalBehavior(behavior *GlobalBehavior) uint64 {
+	hasher := fnv.New64a()
+	add := func(value string) {
+		if value == "" {
+			return
+		}
+		_, _ = hasher.Write([]byte(value))
 	}
-	if behavior.SrcPort != nil {
-		add(fmt.Sprintf("%d", *behavior.SrcPort))
+
+	base := &behavior.behaviorBase
+	add(string(base.Classification))
+	add(string(base.Scope))
+	if base.context != nil && base.context.srcHost != 0 {
+		add(base.context.srcHost.String())
 	}
-	if behavior.DstIP != nil {
-		add(*behavior.DstIP)
-	}
-	if behavior.DstPort != nil {
-		add(fmt.Sprintf("%d", *behavior.DstPort))
-	}
-	if behavior.Proto != "" {
-		add(behavior.Proto)
-	}
-	if behavior.DstIPs != nil {
-		for _, ip := range *behavior.DstIPs {
-			add(ip)
+	for _, flow := range behavior.Flows {
+		if flow.DstHost != 0 {
+			add(flow.DstHost.String())
 		}
 	}
-
-	timestamp := behavior.Timestamp
-	if timestamp.IsZero() {
-		timestamp = time.Now()
-	}
-	add(timestamp.UTC().Format(time.RFC3339Nano))
-
+	add(base.Timestamp.UTC().Format(time.RFC3339Nano))
 	return hasher.Sum64()
 }

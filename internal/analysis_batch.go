@@ -14,8 +14,6 @@ import (
 	"github.com/google/gopacket/layers"
 )
 
-// == Analysis
-
 const defaultMaxFlows = 1024
 
 type AnalysisConfiguration struct {
@@ -41,7 +39,7 @@ type AnalysisConfiguration struct {
 	result            batchResult
 	packetRings       map[Flow]*packetRing
 	summary           AnalysisSummary
-	captureBehavior   func(*AnalysisConfiguration, *Behavior) (bool, error)
+	captureBehavior   func(*AnalysisConfiguration, *LocalBehavior) (bool, error)
 	previousScanHosts []BehaviorFlow
 
 	// static context for logging
@@ -114,7 +112,6 @@ type batchResult struct {
 type AnalysisContext struct {
 	// instance configuration
 	srcHost            Host
-	hasSrcHost         bool
 	c2Host             Host
 	hasC2Host          bool
 	sampleID           string        // unique identifier to match behavior to a malware sample
@@ -209,7 +206,7 @@ func NewAnalysisConfiguration(
 	calibrate bool,
 	savePackets int,
 	captureDir string,
-	captureBehavior func(*AnalysisConfiguration, *Behavior) (bool, error),
+	captureBehavior func(*AnalysisConfiguration, *LocalBehavior) (bool, error),
 ) *AnalysisConfiguration {
 	var (
 		file        *os.File
@@ -235,11 +232,11 @@ func NewAnalysisConfiguration(
 	// source and C2 IPs should be excluded from analysis
 	filterIPs = append(filterIPs, srcIP, c2IP)
 	uninterestingIPs := map[Host]bool{}
-	srcHost, hasSrcHost := hostKeyFromIPv4String(srcIP)
-	c2Host, hasC2Host := hostKeyFromIPv4String(c2IP)
+	srcHost, _ := hostFromIPv4String(srcIP)
+	c2Host, hasC2Host := hostFromIPv4String(c2IP)
 
 	for _, ip := range filterIPs {
-		if host, ok := hostKeyFromIPv4String(ip); ok {
+		if host, ok := hostFromIPv4String(ip); ok {
 			uninterestingIPs[host] = true
 		}
 	}
@@ -273,7 +270,6 @@ func NewAnalysisConfiguration(
 		packetRings:              buffers,
 		context: AnalysisContext{
 			srcHost:            srcHost,
-			hasSrcHost:         hasSrcHost,
 			c2Host:             c2Host,
 			hasC2Host:          hasC2Host,
 			sampleID:           sampleID,
@@ -362,10 +358,10 @@ func (config *AnalysisConfiguration) shouldTrackFlow(key Flow) bool {
 	if config.savePackets <= 0 {
 		return false
 	}
-	if src, ok := hostKeyFromEndpoint(key.NetworkFlow.Src()); ok && config.context.uninterestingHosts[src] {
+	if src, ok := hostFromEndpoint(key.NetworkFlow.Src()); ok && config.context.uninterestingHosts[src] {
 		return true
 	}
-	if dst, ok := hostKeyFromEndpoint(key.NetworkFlow.Dst()); ok && config.context.uninterestingHosts[dst] {
+	if dst, ok := hostFromEndpoint(key.NetworkFlow.Dst()); ok && config.context.uninterestingHosts[dst] {
 		return true
 	}
 	return false
@@ -408,7 +404,7 @@ func (config *AnalysisConfiguration) flushResults() {
 	}
 
 	type localBehaviorResult struct {
-		behavior *Behavior
+		behavior *LocalBehavior
 		key      Flow
 	}
 	localBehaviors := make([]localBehaviorResult, 0, len(config.result.flowPacketCounts))
@@ -422,9 +418,7 @@ func (config *AnalysisConfiguration) flushResults() {
 			continue
 		}
 		localBehaviors = append(localBehaviors, localBehaviorResult{behavior: localBehavior, key: key})
-		if localBehavior.Classification == Attack &&
-			localBehavior.Flow != nil &&
-			localBehavior.Flow.HasDstHost {
+		if localBehavior.Classification == Attack && localBehavior.Flow.DstHost != 0 {
 			attacked[localBehavior.Flow.DstHost] = true
 		}
 	}
@@ -458,15 +452,14 @@ func (config *AnalysisConfiguration) flushResults() {
 	// classify global behavior using local attack results
 	globalPacketRate := float64(config.result.globalPacketCount) / durationSeconds
 	scanRate := computeScanRate(durationSeconds, len(scanTargets))
-	scanLabels := hostLabels(scanTargets)
 
 	globalBehavior := config.classifyGlobalBehavior(
 		globalPacketRate,
 		scanRate,
-		scanLabels,
+		scanTargets,
 		config.result.windowStart,
 	)
-	config.logBehavior(globalBehavior, nil)
+	config.logGlobalBehavior(globalBehavior)
 
 	// then log local behavior
 	capturedFlows := make(map[Flow]struct{})
@@ -488,7 +481,7 @@ func (config *AnalysisConfiguration) flushResults() {
 				captured = config.snapshotFlowPackets(captureKey)
 			}
 		}
-		config.logBehavior(localBehavior, captured)
+		config.logLocalBehavior(localBehavior, captured)
 	}
 
 }
@@ -522,11 +515,11 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 	if config.context.hasC2Host && config.PacketRateThreshold > 0 {
 		for key, count := range destinations {
 			behaviorFlow := behaviorFlowFromFlow(key)
-			if !behaviorFlow.HasDstHost {
+			if behaviorFlow.DstHost == 0 {
 				continue
 			}
 			packetRate := float64(count) / durationSeconds
-			if packetRate > config.PacketRateThreshold && behaviorFlow.HasDstHost {
+			if packetRate > config.PacketRateThreshold {
 				attacked[behaviorFlow.DstHost] = true
 			}
 		}
@@ -546,7 +539,7 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 
 	scanRate := computeScanRate(durationSeconds, len(scanTargets))
 
-	topFlow, topCount := topFlowByCount(destinations)
+	topFlow, topCount := destinations.topFlowByCount()
 	topRate := 0.0
 	if topCount > 0 {
 		topRate = float64(topCount) / durationSeconds
@@ -597,8 +590,8 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 	config.logger.Info("Calibration window", args...)
 }
 
-func (config *AnalysisConfiguration) logBehavior(
-	behavior *Behavior,
+func (config *AnalysisConfiguration) logLocalBehavior(
+	behavior *LocalBehavior,
 	packets []gopacket.Packet,
 ) {
 	if behavior == nil {
@@ -606,11 +599,6 @@ func (config *AnalysisConfiguration) logBehavior(
 	}
 
 	switch behavior.Classification {
-	case Idle:
-		if !config.showIdle {
-			return
-		}
-		config.summary.IdleEvents++
 	case Attack:
 		var captured bool
 		if config.savePackets > 0 {
@@ -621,7 +609,6 @@ func (config *AnalysisConfiguration) logBehavior(
 		}
 		config.summary.AttackEvents++
 	case Scan:
-		config.summary.ScanEvents++
 	case OutboundConnection:
 		// outbound events are logged to Eve but don't alter the summary
 	default:
@@ -632,7 +619,7 @@ func (config *AnalysisConfiguration) logBehavior(
 		return
 	}
 
-	if err := config.eventLogger.LogBehavior(behavior); err != nil {
+	if err := config.eventLogger.LogLocalBehavior(behavior); err != nil {
 		config.logger.Error("Failed to write eve event", "error", err)
 	} else {
 		config.logger.Debug(
@@ -643,7 +630,39 @@ func (config *AnalysisConfiguration) logBehavior(
 	}
 }
 
-func (config *AnalysisConfiguration) persistPackets(behavior *Behavior, packets []gopacket.Packet) bool {
+func (config *AnalysisConfiguration) logGlobalBehavior(behavior *GlobalBehavior) {
+	if behavior == nil {
+		return
+	}
+
+	switch behavior.Classification {
+	case Idle:
+		if !config.showIdle {
+			return
+		}
+		config.summary.IdleEvents++
+	case Scan:
+		config.summary.ScanEvents++
+	default:
+		return
+	}
+
+	if config.eventLogger == nil {
+		return
+	}
+
+	if err := config.eventLogger.LogGlobalBehavior(behavior); err != nil {
+		config.logger.Error("Failed to write eve event", "error", err)
+	} else {
+		config.logger.Debug(
+			"Emitted eve event",
+			"classification", behavior.Classification,
+			"scope", behavior.Scope,
+		)
+	}
+}
+
+func (config *AnalysisConfiguration) persistPackets(behavior *LocalBehavior, packets []gopacket.Packet) bool {
 	if config.savePackets <= 0 || behavior == nil {
 		return false
 	}
@@ -676,7 +695,7 @@ func (config *AnalysisConfiguration) classifyLocalBehavior(
 	packetRate float64,
 	flow BehaviorFlow,
 	eventTime time.Time,
-) *Behavior {
+) *LocalBehavior {
 	flowCopy := flow // avoid referencing loop variable
 
 	config.logger.Debug(
@@ -689,34 +708,26 @@ func (config *AnalysisConfiguration) classifyLocalBehavior(
 
 	// attacks can only occur if a C2 IP is specified (assumed)
 	if config != nil && config.context.hasC2Host && packetRate > config.PacketRateThreshold {
-		return NewBehavior(
+		return NewLocalBehavior(
 			Attack,
-			Local,
 			eventTime,
 			packetRate,
 			config.PacketRateThreshold,
-			0,
-			0,
-			&flowCopy,
-			nil,
+			flowCopy,
 			&config.context,
 		)
 	}
-	return NewBehavior(
+	return NewLocalBehavior(
 		OutboundConnection,
-		Local,
 		eventTime,
 		packetRate,
 		config.PacketRateThreshold,
-		0,
-		0,
-		&flowCopy,
-		nil,
+		flowCopy,
 		&config.context,
 	)
 }
 
-func (config *AnalysisConfiguration) shouldLogLocalBehavior(globalBehavior *Behavior, localBehavior *Behavior) bool {
+func (config *AnalysisConfiguration) shouldLogLocalBehavior(globalBehavior *GlobalBehavior, localBehavior *LocalBehavior) bool {
 	if localBehavior == nil {
 		return false
 	}
@@ -729,9 +740,9 @@ func (config *AnalysisConfiguration) shouldLogLocalBehavior(globalBehavior *Beha
 func (config *AnalysisConfiguration) classifyGlobalBehavior(
 	globalPacketRate float64,
 	scanRate float64,
-	scanLabels *[]string,
+	scanFlows []BehaviorFlow,
 	eventTime time.Time,
-) *Behavior {
+) *GlobalBehavior {
 	if globalPacketRate > config.PacketRateThreshold {
 		config.logger.Debug(
 			"Detected global high packet rate",
@@ -754,30 +765,26 @@ func (config *AnalysisConfiguration) classifyGlobalBehavior(
 			"threshold", config.DestinationRateThreshold,
 		)
 
-		return NewBehavior(
+		return NewGlobalBehavior(
 			Scan,
-			Global,
 			eventTime,
 			globalPacketRate,
 			config.PacketRateThreshold,
 			scanRate,
 			config.DestinationRateThreshold,
-			nil,
-			scanLabels,
+			scanFlows,
 			&config.context,
 		)
 	}
 
-	return NewBehavior(
+	return NewGlobalBehavior(
 		Idle,
-		Global,
 		eventTime,
 		globalPacketRate,
 		config.PacketRateThreshold,
 		scanRate,
 		config.DestinationRateThreshold,
-		nil,
-		scanLabels,
+		scanFlows,
 		&config.context,
 	)
 }
@@ -838,7 +845,7 @@ func (config *AnalysisConfiguration) CalibrationSummary() CalibrationSummary {
 	}
 }
 
-func defaultCaptureBehavior(config *AnalysisConfiguration, behavior *Behavior) (bool, error) {
+func defaultCaptureBehavior(config *AnalysisConfiguration, behavior *LocalBehavior) (bool, error) {
 	if config == nil {
 		return false, errors.New("config is nil")
 	}
@@ -846,6 +853,6 @@ func defaultCaptureBehavior(config *AnalysisConfiguration, behavior *Behavior) (
 		return false, nil
 	}
 	return (behavior.Classification == Attack &&
-		behavior.DstIP != nil &&
+		behavior.Flow.DstHost != 0 &&
 		config.savePackets > 0), nil
 }

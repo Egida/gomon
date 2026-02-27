@@ -252,7 +252,7 @@ func executeAnalysis(cmd *cobra.Command, args []string) error {
 			summary.RecommendedPacketThreshold,
 			summary.RecommendedDestinationThreshold,
 		)
-		if summary.MaxFlowRate > 0 && summary.MaxFlow.HasDstHost {
+		if summary.MaxFlowRate > 0 {
 			cmd.Printf(
 				"Top flow: %s (rate %.4f packets/s, %d packets)\n",
 				summary.MaxFlow.String(),
