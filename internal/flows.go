@@ -83,36 +83,17 @@ func flowFromPacket(packet gopacket.Packet) (Flow, bool) {
 
 type flowCounts map[Flow]int
 
-func (f flowCounts) topFlowByCount() (BehaviorFlow, int) {
-	if len(f) == 0 {
-		return BehaviorFlow{}, 0
-	}
-
-	var (
-		maxFlow  BehaviorFlow
-		maxCount int
-		maxLabel string
-		found    bool
-	)
+// Retrieves the flow with the most counts. This function is nondeterministic in
+// case of ties.
+func (f flowCounts) topFlowByCount() (Flow, int) {
+	topFlow := Flow{}
+	topCount := 0
 
 	for flow, count := range f {
-		if count <= 0 {
-			continue
-		}
-		behaviorFlow := behaviorFlowFromFlow(flow)
-		label := behaviorFlow.String()
-
-		if !found || count > maxCount || (count == maxCount && label < maxLabel) {
-			maxCount = count
-			maxFlow = behaviorFlow
-			maxLabel = label
-			found = true
+		if topCount < max(topCount, count) {
+			topCount = count
+			topFlow = flow
 		}
 	}
-
-	if !found {
-		return BehaviorFlow{}, 0
-	}
-
-	return maxFlow, maxCount
+	return topFlow, topCount
 }

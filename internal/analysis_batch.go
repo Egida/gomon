@@ -540,16 +540,17 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 	scanRate := computeScanRate(durationSeconds, len(scanTargets))
 
 	topFlow, topCount := destinations.topFlowByCount()
+	topBehaviorFlow := behaviorFlowFromFlow(topFlow)
 	topRate := 0.0
 	if topCount > 0 {
 		topRate = float64(topCount) / durationSeconds
 	}
 	topLabel := "<none>"
 	if topCount > 0 {
-		topLabel = topFlow.String()
+		topLabel = topBehaviorFlow.String()
 	}
 
-	config.calibration.update(globalPacketRate, scanRate, topFlow, topCount, topRate)
+	config.calibration.update(globalPacketRate, scanRate, topBehaviorFlow, topCount, topRate)
 
 	nullTestActivity := "idle"
 	if config.result.globalPacketCount > 0 {
@@ -581,9 +582,9 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 	if topCount > 0 {
 		args = append(
 			args,
-			"maxFlowIP", topFlow.DstHost.String(),
-			"maxFlowPort", topFlow.DstPort,
-			"maxFlowProto", topFlow.Protocol,
+			"maxFlowIP", topBehaviorFlow.DstHost.String(),
+			"maxFlowPort", topBehaviorFlow.DstPort,
+			"maxFlowProto", topBehaviorFlow.Protocol,
 		)
 	}
 
