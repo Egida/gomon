@@ -16,7 +16,7 @@ import (
 
 // == Analysis
 
-const defaultMaxDestinations = 1024
+const defaultMaxFlows = 1024
 
 type AnalysisConfiguration struct {
 	// configuration
@@ -24,7 +24,7 @@ type AnalysisConfiguration struct {
 	DestinationRateThreshold float64
 	WindowSize               time.Duration
 	scanDetectionMode        ScanDetectionMode
-	maxDestinations          int // maximum number of destinations to analyze per window
+	maxFlows                 int // maximum number of destinations to analyze per window
 	calibrate                bool
 
 	// extra logging options
@@ -39,10 +39,10 @@ type AnalysisConfiguration struct {
 	eventLogger *EveLogger
 
 	result            batchResult
-	buffers           map[string]*packetRing
+	packetRings       map[Flow]*packetRing
 	summary           AnalysisSummary
 	captureBehavior   func(*AnalysisConfiguration, *Behavior) (bool, error)
-	previousScanHosts []Destination
+	previousScanHosts []BehaviorFlow
 
 	// static context for logging
 	context AnalysisContext
@@ -106,34 +106,36 @@ func ParseScanDetectionMode(value string) (ScanDetectionMode, error) {
 }
 
 type batchResult struct {
-	windowStart             time.Time
-	destinationPacketCounts destinationCounts
-	globalPacketCount       int
+	windowStart       time.Time
+	flowPacketCounts  flowCounts
+	globalPacketCount int
 }
 
 type AnalysisContext struct {
 	// instance configuration
-	srcIP            string
-	c2IP             string
-	sampleID         string          // unique identifier to match behavior to a malware sample
-	uninterestingIPs map[string]bool // List of IP addresses that are not interesting for analysis
+	srcHost            Host
+	hasSrcHost         bool
+	c2Host             Host
+	hasC2Host          bool
+	sampleID           string        // unique identifier to match behavior to a malware sample
+	uninterestingHosts map[Host]bool // List of IP addresses that are not interesting for analysis
 }
 
 type calibrationStats struct {
-	windows                 int
-	packetRateSum           float64
-	packetRateMax           float64
-	hostRateSum             float64
-	hostRateMax             float64
-	topDestinationRateMax   float64
-	topDestinationCountMax  int
-	topDestinationCandidate Destination
+	windows          int
+	packetRateSum    float64
+	packetRateMax    float64
+	hostRateSum      float64
+	hostRateMax      float64
+	topFlowRateMax   float64
+	topFlowCountMax  int
+	topFlowCandidate BehaviorFlow
 }
 
 func (s *calibrationStats) update(
 	packetRate float64,
 	hostRate float64,
-	topDestination Destination,
+	topFlow BehaviorFlow,
 	topCount int,
 	topRate float64,
 ) {
@@ -149,18 +151,18 @@ func (s *calibrationStats) update(
 	if hostRate > s.hostRateMax {
 		s.hostRateMax = hostRate
 	}
-	if topRate > s.topDestinationRateMax {
-		s.topDestinationRateMax = topRate
-		s.topDestinationCountMax = topCount
-		s.topDestinationCandidate = topDestination
+	if topRate > s.topFlowRateMax {
+		s.topFlowRateMax = topRate
+		s.topFlowCountMax = topCount
+		s.topFlowCandidate = topFlow
 		return
 	}
-	if topRate == s.topDestinationRateMax && topRate > 0 {
-		currentLabel := s.topDestinationCandidate.String()
-		candidateLabel := topDestination.String()
+	if topRate == s.topFlowRateMax && topRate > 0 {
+		currentLabel := s.topFlowCandidate.String()
+		candidateLabel := topFlow.String()
 		if currentLabel == "" || candidateLabel < currentLabel {
-			s.topDestinationCountMax = topCount
-			s.topDestinationCandidate = topDestination
+			s.topFlowCountMax = topCount
+			s.topFlowCandidate = topFlow
 		}
 	}
 }
@@ -187,9 +189,9 @@ type CalibrationSummary struct {
 	HostRateMax                     float64
 	RecommendedPacketThreshold      float64
 	RecommendedDestinationThreshold float64
-	MaxDestination                  Destination
-	MaxDestinationRate              float64
-	MaxDestinationPackets           int
+	MaxFlow                         BehaviorFlow
+	MaxFlowRate                     float64
+	MaxFlowPackets                  int
 }
 
 func NewAnalysisConfiguration(
@@ -232,15 +234,19 @@ func NewAnalysisConfiguration(
 
 	// source and C2 IPs should be excluded from analysis
 	filterIPs = append(filterIPs, srcIP, c2IP)
-	uninterestingIPs := map[string]bool{}
+	uninterestingIPs := map[Host]bool{}
+	srcHost, hasSrcHost := hostKeyFromIPv4String(srcIP)
+	c2Host, hasC2Host := hostKeyFromIPv4String(c2IP)
 
 	for _, ip := range filterIPs {
-		uninterestingIPs[ip] = true
+		if host, ok := hostKeyFromIPv4String(ip); ok {
+			uninterestingIPs[host] = true
+		}
 	}
 
-	var buffers map[string]*packetRing
+	var buffers map[Flow]*packetRing
 	if savePackets > 0 {
-		buffers = make(map[string]*packetRing)
+		buffers = make(map[Flow]*packetRing)
 	}
 
 	if captureDir == "" {
@@ -264,15 +270,17 @@ func NewAnalysisConfiguration(
 		showIdle:                 showIdle,
 		savePackets:              savePackets,
 		captureDir:               captureDir,
-		buffers:                  buffers,
+		packetRings:              buffers,
 		context: AnalysisContext{
-			srcIP:            srcIP,
-			c2IP:             c2IP,
-			sampleID:         sampleID,
-			uninterestingIPs: uninterestingIPs,
+			srcHost:            srcHost,
+			hasSrcHost:         hasSrcHost,
+			c2Host:             c2Host,
+			hasC2Host:          hasC2Host,
+			sampleID:           sampleID,
+			uninterestingHosts: uninterestingIPs,
 		},
 		captureBehavior: captureBehavior,
-		maxDestinations: defaultMaxDestinations,
+		maxFlows:        defaultMaxFlows,
 	}
 }
 
@@ -294,21 +302,21 @@ func (config *AnalysisConfiguration) ProcessBatch(
 		config.captureRecentPackets(batch)
 	}
 
-	maxTrackedDestinations := config.maxDestinations
-	if maxTrackedDestinations <= 0 {
-		maxTrackedDestinations = defaultMaxDestinations
+	maxTrackedFlows := config.maxFlows
+	if maxTrackedFlows <= 0 {
+		maxTrackedFlows = defaultMaxFlows
 	}
-	globalPacketCount, destinationPacketCounts, err := countPacketsByDestination(
+	globalPacketCount, flowPacketCounts, err := countPacketsByFlow(
 		&batch,
-		config.context.uninterestingIPs,
-		maxTrackedDestinations,
+		config.context.uninterestingHosts,
+		maxTrackedFlows,
 	)
 	if err != nil {
-		var maxErr *MaxDestinationsReached
+		var maxErr *MaxFlowsReached
 		if errors.As(err, &maxErr) {
 			config.logger.Warn(
-				"Maximum number of destinations reached; continuing with partial counts",
-				"limit", maxTrackedDestinations,
+				"Maximum number of flows reached; continuing with partial counts",
+				"limit", maxTrackedFlows,
 			)
 		} else {
 			config.logger.Error("Error counting packet totals", "error", err)
@@ -317,76 +325,57 @@ func (config *AnalysisConfiguration) ProcessBatch(
 
 	// Save intermediate results; normalization happens when the window flushes.
 	config.result.globalPacketCount += globalPacketCount
-	config.result.destinationPacketCounts = mergeDestinationCounts(
-		config.result.destinationPacketCounts,
-		destinationPacketCounts,
+	config.result.flowPacketCounts = mergeFlowCounts(
+		config.result.flowPacketCounts,
+		flowPacketCounts,
 	)
 }
 
 func (config *AnalysisConfiguration) captureRecentPackets(batch []gopacket.Packet) {
-	if config.savePackets <= 0 || len(batch) == 0 || config.buffers == nil {
+	if config.savePackets <= 0 || len(batch) == 0 || config.packetRings == nil {
 		return
 	}
 
 	for _, packet := range batch {
-		if packet == nil {
+		key, ok := flowFromPacket(packet)
+		if !ok {
 			continue
 		}
-		networkLayer := packet.NetworkLayer()
-		if networkLayer == nil {
-			continue
-		}
-
-		var hosts []string
-		src := networkLayer.NetworkFlow().Src().String()
-		if src != "" {
-			hosts = append(hosts, src)
-		}
-		dst := networkLayer.NetworkFlow().Dst().String()
-		if dst != "" {
-			hosts = append(hosts, dst)
-		}
-
-		if len(hosts) == 0 {
-			continue
-		}
-
-		seen := make(map[string]struct{}, len(hosts))
-		for _, host := range hosts {
-			if _, ok := seen[host]; ok {
-				continue
-			}
-			seen[host] = struct{}{}
-			config.appendPacketForHost(host, packet)
-		}
+		config.appendPacketForFlow(key, packet)
 	}
 }
 
-func (config *AnalysisConfiguration) appendPacketForHost(host string, packet gopacket.Packet) {
-	if !config.shouldTrackHost(host) {
+func (config *AnalysisConfiguration) appendPacketForFlow(key Flow, packet gopacket.Packet) {
+	if !config.shouldTrackFlow(key) {
 		return
 	}
 
-	buf, ok := config.buffers[host]
+	buf, ok := config.packetRings[key]
 	if !ok {
 		buf = newPacketRing(config.savePackets)
-		config.buffers[host] = buf
+		config.packetRings[key] = buf
 	}
 	buf.add(packet)
 }
 
-func (config *AnalysisConfiguration) shouldTrackHost(host string) bool {
-	if host == "" || config.savePackets <= 0 {
+func (config *AnalysisConfiguration) shouldTrackFlow(key Flow) bool {
+	if config.savePackets <= 0 {
 		return false
 	}
-	return config.context.uninterestingIPs[host]
+	if src, ok := hostKeyFromEndpoint(key.NetworkFlow.Src()); ok && config.context.uninterestingHosts[src] {
+		return true
+	}
+	if dst, ok := hostKeyFromEndpoint(key.NetworkFlow.Dst()); ok && config.context.uninterestingHosts[dst] {
+		return true
+	}
+	return false
 }
 
-func (config *AnalysisConfiguration) snapshotHostPackets(host string) []gopacket.Packet {
-	if config.buffers == nil {
+func (config *AnalysisConfiguration) snapshotFlowPackets(key Flow) []gopacket.Packet {
+	if config.packetRings == nil {
 		return nil
 	}
-	buf, ok := config.buffers[host]
+	buf, ok := config.packetRings[key]
 	if !ok || buf == nil {
 		return nil
 	}
@@ -394,7 +383,7 @@ func (config *AnalysisConfiguration) snapshotHostPackets(host string) []gopacket
 }
 
 func (config *AnalysisConfiguration) flushResults() {
-	if config.result.globalPacketCount == 0 && len(config.result.destinationPacketCounts) == 0 {
+	if config.result.globalPacketCount == 0 && len(config.result.flowPacketCounts) == 0 {
 		return
 	}
 	if config.result.windowStart.IsZero() {
@@ -418,26 +407,33 @@ func (config *AnalysisConfiguration) flushResults() {
 		return
 	}
 
-	localBehaviors := make([]*Behavior, 0, len(config.result.destinationPacketCounts))
-	attacked := make(map[string]bool)
+	type localBehaviorResult struct {
+		behavior *Behavior
+		key      Flow
+	}
+	localBehaviors := make([]localBehaviorResult, 0, len(config.result.flowPacketCounts))
+	attacked := make(map[Host]bool)
 
-	for _, entry := range config.result.destinationPacketCounts {
-		packetRate := float64(entry.Count) / durationSeconds
-		localBehavior := config.classifyLocalBehavior(packetRate, entry.Destination, config.result.windowStart)
+	for key, count := range config.result.flowPacketCounts {
+		packetRate := float64(count) / durationSeconds
+		behaviorFlow := behaviorFlowFromFlow(key)
+		localBehavior := config.classifyLocalBehavior(packetRate, behaviorFlow, config.result.windowStart)
 		if localBehavior == nil {
 			continue
 		}
-		localBehaviors = append(localBehaviors, localBehavior)
-		if localBehavior.Classification == Attack && localBehavior.DstIP != nil {
-			attacked[*localBehavior.DstIP] = true
+		localBehaviors = append(localBehaviors, localBehaviorResult{behavior: localBehavior, key: key})
+		if localBehavior.Classification == Attack &&
+			localBehavior.Flow != nil &&
+			localBehavior.Flow.HasDstHost {
+			attacked[localBehavior.Flow.DstHost] = true
 		}
 	}
 
-	scanCounts := config.result.destinationPacketCounts
+	scanCounts := config.result.flowPacketCounts
 	if config.scanDetectionMode == ScanDetectionFilteredHostRate {
-		scanCounts = config.filterNonAttackingDestinations(scanCounts, attacked)
+		scanCounts = config.filterNonAttackingFlows(scanCounts, attacked)
 	}
-	scanDestinations := destinationsFromCounts(scanCounts)
+	scanDestinations := flowsFromCounts(scanCounts)
 	scanHosts := uniqueHosts(scanDestinations)
 	scanTargets := scanHosts
 	if config.scanDetectionMode == ScanDetectionNewHostRate {
@@ -451,8 +447,8 @@ func (config *AnalysisConfiguration) flushResults() {
 		"windowEnd", windowEnd,
 		"windowSeconds", durationSeconds,
 		"globalPacketCount", config.result.globalPacketCount,
-		"destinationPacketCounts", config.result.destinationPacketCounts,
-		"windowDestinationCount", len(config.result.destinationPacketCounts),
+		"flowPacketCounts", config.result.flowPacketCounts,
+		"windowFlowCount", len(config.result.flowPacketCounts),
 		"scanDetectionMode", config.scanDetectionMode,
 		"attackHostCount", len(attacked),
 		"scanHostCount", len(scanHosts),
@@ -473,25 +469,23 @@ func (config *AnalysisConfiguration) flushResults() {
 	config.logBehavior(globalBehavior, nil)
 
 	// then log local behavior
-	capturedHosts := make(map[string]struct{})
-	for _, localBehavior := range localBehaviors {
+	capturedFlows := make(map[Flow]struct{})
+	for _, local := range localBehaviors {
+		localBehavior := local.behavior
 		if !config.shouldLogLocalBehavior(globalBehavior, localBehavior) {
 			continue
 		}
 		var captured []gopacket.Packet
-		var captureHost string
-		if localBehavior != nil && localBehavior.DstIP != nil {
-			captureHost = *localBehavior.DstIP
-		}
+		captureKey := local.key
 
 		if capture, err := config.captureBehavior(config, localBehavior); err != nil {
 			config.logger.Error("Failed to capture packets", "error", err)
-		} else if capture && captureHost != "" {
-			if _, seen := capturedHosts[captureHost]; seen {
-				config.logger.Debug("Skipping duplicate capture for host", "host", captureHost)
+		} else if capture {
+			if _, seen := capturedFlows[captureKey]; seen {
+				config.logger.Debug("Skipping duplicate capture for flow")
 			} else {
-				capturedHosts[captureHost] = struct{}{}
-				captured = config.snapshotHostPackets(captureHost)
+				capturedFlows[captureKey] = struct{}{}
+				captured = config.snapshotFlowPackets(captureKey)
 			}
 		}
 		config.logBehavior(localBehavior, captured)
@@ -502,14 +496,14 @@ func (config *AnalysisConfiguration) flushResults() {
 func (config *AnalysisConfiguration) resetWindowState() {
 	config.result = batchResult{}
 	if config.savePackets <= 0 {
-		config.buffers = nil
+		config.packetRings = nil
 		return
 	}
-	if config.buffers == nil {
-		config.buffers = make(map[string]*packetRing)
+	if config.packetRings == nil {
+		config.packetRings = make(map[Flow]*packetRing)
 		return
 	}
-	clear(config.buffers)
+	clear(config.packetRings)
 }
 
 func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, durationSeconds float64) {
@@ -521,28 +515,29 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 	}
 
 	globalPacketRate := float64(config.result.globalPacketCount) / durationSeconds
-	destinations := config.result.destinationPacketCounts
+	destinations := config.result.flowPacketCounts
 
-	attacked := make(map[string]bool)
+	attacked := make(map[Host]bool)
 
-	if config.context.c2IP != "" && config.PacketRateThreshold > 0 {
-		for _, entry := range destinations {
-			if entry.Destination.IP == "" {
+	if config.context.hasC2Host && config.PacketRateThreshold > 0 {
+		for key, count := range destinations {
+			behaviorFlow := behaviorFlowFromFlow(key)
+			if !behaviorFlow.HasDstHost {
 				continue
 			}
-			packetRate := float64(entry.Count) / durationSeconds
-			if packetRate > config.PacketRateThreshold {
-				attacked[entry.Destination.IP] = true
+			packetRate := float64(count) / durationSeconds
+			if packetRate > config.PacketRateThreshold && behaviorFlow.HasDstHost {
+				attacked[behaviorFlow.DstHost] = true
 			}
 		}
 	}
 
 	scanCounts := destinations
 	if config.scanDetectionMode == ScanDetectionFilteredHostRate {
-		scanCounts = config.filterNonAttackingDestinations(scanCounts, attacked)
+		scanCounts = config.filterNonAttackingFlows(scanCounts, attacked)
 	}
 
-	scanHosts := uniqueHosts(destinationsFromCounts(scanCounts))
+	scanHosts := uniqueHosts(flowsFromCounts(scanCounts))
 	scanTargets := scanHosts
 	if config.scanDetectionMode == ScanDetectionNewHostRate {
 		scanTargets = newHosts(scanHosts, config.previousScanHosts)
@@ -551,17 +546,17 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 
 	scanRate := computeScanRate(durationSeconds, len(scanTargets))
 
-	topDestination, topCount := topDestinationByCount(destinations)
+	topFlow, topCount := topFlowByCount(destinations)
 	topRate := 0.0
 	if topCount > 0 {
 		topRate = float64(topCount) / durationSeconds
 	}
 	topLabel := "<none>"
 	if topCount > 0 {
-		topLabel = topDestination.String()
+		topLabel = topFlow.String()
 	}
 
-	config.calibration.update(globalPacketRate, scanRate, topDestination, topCount, topRate)
+	config.calibration.update(globalPacketRate, scanRate, topFlow, topCount, topRate)
 
 	nullTestActivity := "idle"
 	if config.result.globalPacketCount > 0 {
@@ -573,7 +568,7 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 		"windowEnd", windowEnd,
 		"windowSeconds", durationSeconds,
 		"packetCount", config.result.globalPacketCount,
-		"destinationCount", len(destinations),
+		"flowCount", len(destinations),
 		"scanTargetCount", len(scanTargets),
 		"scanDetectionMode", config.scanDetectionMode.String(),
 		"globalPacketRate", globalPacketRate,
@@ -584,18 +579,18 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 		"hostRateMax", config.calibration.hostRateMax,
 		"requiredPacketThreshold", topRate,
 		"requiredDestinationThreshold", scanRate,
-		"maxDestination", topLabel,
-		"maxDestinationPackets", topCount,
-		"maxDestinationRate", topRate,
+		"maxFlow", topLabel,
+		"maxFlowPackets", topCount,
+		"maxFlowRate", topRate,
 		"nullTestActivity", nullTestActivity,
 	}
 
 	if topCount > 0 {
 		args = append(
 			args,
-			"maxDestinationIP", topDestination.IP,
-			"maxDestinationPort", topDestination.Port,
-			"maxDestinationProto", topDestination.Protocol,
+			"maxFlowIP", topFlow.DstHost.String(),
+			"maxFlowPort", topFlow.DstPort,
+			"maxFlowProto", topFlow.Protocol,
 		)
 	}
 
@@ -654,9 +649,6 @@ func (config *AnalysisConfiguration) persistPackets(behavior *Behavior, packets 
 	}
 
 	data := packets
-	if len(data) == 0 && behavior.DstIP != nil {
-		data = config.snapshotHostPackets(*behavior.DstIP)
-	}
 	if len(data) == 0 {
 		return false
 	}
@@ -682,21 +674,21 @@ func (config *AnalysisConfiguration) persistPackets(behavior *Behavior, packets 
 
 func (config *AnalysisConfiguration) classifyLocalBehavior(
 	packetRate float64,
-	destination Destination,
+	flow BehaviorFlow,
 	eventTime time.Time,
 ) *Behavior {
-	destCopy := destination // avoid referencing loop variable
+	flowCopy := flow // avoid referencing loop variable
 
 	config.logger.Debug(
 		"Classifying local behavior",
 		"packetRate", packetRate,
 		"threshold", config.PacketRateThreshold,
-		"destination", destCopy.String(),
-		"protocol", destCopy.Protocol,
+		"flow", flowCopy.String(),
+		"protocol", flowCopy.Protocol,
 	)
 
 	// attacks can only occur if a C2 IP is specified (assumed)
-	if config != nil && config.context.c2IP != "" && packetRate > config.PacketRateThreshold {
+	if config != nil && config.context.hasC2Host && packetRate > config.PacketRateThreshold {
 		return NewBehavior(
 			Attack,
 			Local,
@@ -705,7 +697,7 @@ func (config *AnalysisConfiguration) classifyLocalBehavior(
 			config.PacketRateThreshold,
 			0,
 			0,
-			&destCopy,
+			&flowCopy,
 			nil,
 			&config.context,
 		)
@@ -718,7 +710,7 @@ func (config *AnalysisConfiguration) classifyLocalBehavior(
 		config.PacketRateThreshold,
 		0,
 		0,
-		&destCopy,
+		&flowCopy,
 		nil,
 		&config.context,
 	)
@@ -790,19 +782,20 @@ func (config *AnalysisConfiguration) classifyGlobalBehavior(
 	)
 }
 
-func (config *AnalysisConfiguration) filterNonAttackingDestinations(
-	destinations destinationCounts,
-	attacked map[string]bool,
-) destinationCounts {
+func (config *AnalysisConfiguration) filterNonAttackingFlows(
+	destinations flowCounts,
+	attacked map[Host]bool,
+) flowCounts {
 	if len(destinations) == 0 || len(attacked) == 0 {
 		return destinations
 	}
 
-	filtered := make(destinationCounts, len(destinations))
+	filtered := make(flowCounts, len(destinations))
 
-	for key, entry := range destinations {
-		if !attacked[entry.Destination.IP] {
-			filtered[key] = entry
+	for key, count := range destinations {
+		behaviorFlow := behaviorFlowFromFlow(key)
+		if !attacked[behaviorFlow.DstHost] {
+			filtered[key] = count
 		}
 	}
 
@@ -837,11 +830,11 @@ func (config *AnalysisConfiguration) CalibrationSummary() CalibrationSummary {
 		PacketRateMax:                   stats.packetRateMax,
 		HostRateAvg:                     stats.hostRateAvg(),
 		HostRateMax:                     stats.hostRateMax,
-		RecommendedPacketThreshold:      stats.topDestinationRateMax,
+		RecommendedPacketThreshold:      stats.topFlowRateMax,
 		RecommendedDestinationThreshold: stats.hostRateMax,
-		MaxDestination:                  stats.topDestinationCandidate,
-		MaxDestinationRate:              stats.topDestinationRateMax,
-		MaxDestinationPackets:           stats.topDestinationCountMax,
+		MaxFlow:                         stats.topFlowCandidate,
+		MaxFlowRate:                     stats.topFlowRateMax,
+		MaxFlowPackets:                  stats.topFlowCountMax,
 	}
 }
 

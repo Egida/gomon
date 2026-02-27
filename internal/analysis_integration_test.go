@@ -37,6 +37,12 @@ func TestEveAttackFormatting(t *testing.T) {
 	if attack.DestIP != "198.51.100.10" {
 		t.Fatalf("expected DestIP 198.51.100.10, got %s", attack.DestIP)
 	}
+	if attack.SrcIP != "10.0.0.5" {
+		t.Fatalf("expected SrcIP 10.0.0.5, got %s", attack.SrcIP)
+	}
+	if attack.SrcPort != 40000 {
+		t.Fatalf("expected SrcPort 40000, got %d", attack.SrcPort)
+	}
 	if attack.DestPort != 8080 {
 		t.Fatalf("expected DestPort 8080, got %d", attack.DestPort)
 	}
@@ -51,8 +57,39 @@ func TestEveAttackFormatting(t *testing.T) {
 	if gomon == nil || gomon.C2IP == nil || *gomon.C2IP != "203.0.113.50" {
 		t.Fatalf("expected gomon.c2_ip 203.0.113.50, got %#v", gomon)
 	}
+	if gomon.SrcPort == nil || *gomon.SrcPort != 40000 {
+		t.Fatalf("expected gomon.src_port 40000, got %#v", gomon)
+	}
 	if gomon.PacketThreshold != 1 {
 		t.Fatalf("expected packet_threshold 1, got %v", gomon.PacketThreshold)
+	}
+}
+
+func TestAttackWithSpoofedSourceIP(t *testing.T) {
+	buf := &bytes.Buffer{}
+	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 1, 10)
+
+	spoofedSrc := "192.0.2.250"
+	packets := []gopacket.Packet{
+		buildTestPacketWithSrc(t, spoofedSrc, layers.IPProtocolTCP, "198.51.100.10", 8080),
+		buildTestPacketWithSrc(t, spoofedSrc, layers.IPProtocolTCP, "198.51.100.10", 8080),
+		buildTestPacketWithSrc(t, spoofedSrc, layers.IPProtocolTCP, "198.51.100.10", 8080),
+	}
+
+	config.ProcessBatch(nil, packets, time.Now())
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+	attack := findEventByCategory(events, "attack")
+	if attack == nil {
+		t.Fatalf("expected attack alert, got %v", events)
+	}
+
+	if attack.SrcIP != spoofedSrc {
+		t.Fatalf("expected spoofed SrcIP %s, got %s", spoofedSrc, attack.SrcIP)
+	}
+	if attack.SrcIP == "10.0.0.5" {
+		t.Fatalf("expected attack SrcIP to differ from context source 10.0.0.5, got %s", attack.SrcIP)
 	}
 }
 
@@ -365,6 +402,7 @@ type parsedEveEvent struct {
 	EventType string        `json:"event_type"`
 	Host      string        `json:"host"`
 	SrcIP     string        `json:"src_ip"`
+	SrcPort   uint16        `json:"src_port"`
 	DestIP    string        `json:"dest_ip"`
 	DestPort  uint16        `json:"dest_port"`
 	Proto     string        `json:"proto"`
@@ -391,6 +429,7 @@ type parsedAlert struct {
 
 type parsedGomon struct {
 	C2IP                     *string `json:"c2_ip"`
+	SrcPort                  *uint16 `json:"src_port"`
 	PacketRate               float64 `json:"packet_rate"`
 	PacketThreshold          float64 `json:"packet_threshold"`
 	DestinationRate          float64 `json:"destination_rate"`
@@ -446,11 +485,33 @@ func findEventsByCategory(events []parsedEveEvent, category string) []parsedEveE
 
 func buildTestPacket(t *testing.T, proto layers.IPProtocol, dstIP string, dstPort uint16) gopacket.Packet {
 	t.Helper()
+	return buildTestPacketWithSrc(t, "10.0.0.5", proto, dstIP, dstPort)
+}
 
-	srcIP := net.IPv4(10, 0, 0, 5)
+func buildTestPacketWithSrc(
+	t *testing.T,
+	srcIP string,
+	proto layers.IPProtocol,
+	dstIP string,
+	dstPort uint16,
+) gopacket.Packet {
+	t.Helper()
+
+	src := net.ParseIP(srcIP)
+	if src == nil {
+		t.Fatalf("invalid src ip %q", srcIP)
+	}
+	src = src.To4()
+	if src == nil {
+		t.Fatalf("src ip must be IPv4, got %q", srcIP)
+	}
 	dst := net.ParseIP(dstIP)
 	if dst == nil {
 		t.Fatalf("invalid dst ip %q", dstIP)
+	}
+	dst = dst.To4()
+	if dst == nil {
+		t.Fatalf("dst ip must be IPv4, got %q", dstIP)
 	}
 
 	eth := layers.Ethernet{
@@ -461,7 +522,7 @@ func buildTestPacket(t *testing.T, proto layers.IPProtocol, dstIP string, dstPor
 	ip := layers.IPv4{
 		Version:  4,
 		IHL:      5,
-		SrcIP:    srcIP,
+		SrcIP:    src,
 		DstIP:    dst,
 		Protocol: proto,
 	}

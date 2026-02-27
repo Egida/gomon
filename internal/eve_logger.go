@@ -23,6 +23,7 @@ type EveEvent struct {
 	EventType string         `json:"event_type"`
 	Host      string         `json:"host,omitempty"`
 	SrcIP     string         `json:"src_ip,omitempty"`
+	SrcPort   uint16         `json:"src_port,omitempty"`
 	DestIP    string         `json:"dest_ip,omitempty"`
 	DestPort  uint16         `json:"dest_port,omitempty"`
 	Proto     string         `json:"proto,omitempty"`
@@ -57,6 +58,7 @@ type EveFlowStats struct {
 type EveDetails struct {
 	Scope                    BehaviorScope `json:"scope,omitempty"`
 	C2IP                     *string       `json:"c2_ip,omitempty"` // easier handling of nil values from behavior
+	SrcPort                  *uint16       `json:"src_port,omitempty"`
 	PacketRate               float64       `json:"packet_rate,omitempty"`
 	PacketThreshold          float64       `json:"packet_threshold,omitempty"`
 	DestinationRate          float64       `json:"destination_rate,omitempty"`
@@ -110,6 +112,9 @@ func behaviorToEveEvent(behavior *Behavior) *EveEvent {
 
 	if behavior.SrcIP != nil {
 		event.SrcIP = *behavior.SrcIP
+	}
+	if behavior.SrcPort != nil {
+		event.SrcPort = *behavior.SrcPort
 	}
 	if behavior.SampleID != "" {
 		event.Host = behavior.SampleID
@@ -193,6 +198,7 @@ func newEveDetails(behavior *Behavior) *EveDetails {
 	d := &EveDetails{
 		Scope:                    behavior.Scope,
 		C2IP:                     behavior.C2IP,
+		SrcPort:                  behavior.SrcPort,
 		PacketRate:               behavior.PacketRate,
 		PacketThreshold:          behavior.PacketThreshold,
 		DestinationRate:          behavior.DestinationRate,
@@ -289,6 +295,9 @@ func flowIDFromBehavior(behavior *Behavior) uint64 {
 
 	if behavior.SrcIP != nil {
 		add(*behavior.SrcIP)
+	}
+	if behavior.SrcPort != nil {
+		add(fmt.Sprintf("%d", *behavior.SrcPort))
 	}
 	if behavior.DstIP != nil {
 		add(*behavior.DstIP)

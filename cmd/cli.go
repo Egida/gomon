@@ -112,7 +112,7 @@ func init() {
 		&ignoreDestIPs,
 		"ignore-dst",
 		nil,
-		"Destination IP addresses to skip when computing metrics (repeatable).",
+		"Flow IP addresses to skip when computing metrics (repeatable).",
 	)
 	RootCmd.Flags().StringVar(
 		&eveLogPath,
@@ -252,12 +252,12 @@ func executeAnalysis(cmd *cobra.Command, args []string) error {
 			summary.RecommendedPacketThreshold,
 			summary.RecommendedDestinationThreshold,
 		)
-		if summary.MaxDestinationRate > 0 && summary.MaxDestination.IP != "" {
+		if summary.MaxFlowRate > 0 && summary.MaxFlow.HasDstHost {
 			cmd.Printf(
-				"Top destination: %s (rate %.4f packets/s, %d packets)\n",
-				summary.MaxDestination.String(),
-				summary.MaxDestinationRate,
-				summary.MaxDestinationPackets,
+				"Top flow: %s (rate %.4f packets/s, %d packets)\n",
+				summary.MaxFlow.String(),
+				summary.MaxFlowRate,
+				summary.MaxFlowPackets,
 			)
 		}
 		return nil

@@ -1,7 +1,8 @@
 package internal
 
 import (
-	"fmt"
+	"encoding/binary"
+	"net/netip"
 	"sort"
 	"strings"
 	"time"
@@ -10,87 +11,105 @@ import (
 	"github.com/google/gopacket/layers"
 )
 
-type MaxDestinationsReached struct{}
+type MaxFlowsReached struct{}
 
-func (e *MaxDestinationsReached) Error() string {
-	return "maximum number of destinations reached"
+func (e *MaxFlowsReached) Error() string {
+	return "maximum number of flows reached"
 }
 
-// Destination identifies a remote endpoint using IP, port, and protocol.
-type Destination struct {
-	IP       string `json:"ip"`
-	Port     uint16 `json:"port,omitempty"`
-	Protocol string `json:"protocol,omitempty"`
+type Host uint32
+
+func (h Host) String() string {
+	var octets [4]byte
+	binary.BigEndian.PutUint32(octets[:], uint32(h))
+	return netip.AddrFrom4(octets).String()
 }
 
-// Equals returns true when the destinations match by IP and port.
-func (d Destination) Equals(other Destination) bool {
-	return d.IP == other.IP && d.Port == other.Port
-}
-
-// HostEquals returns true when the destinations share the same host IP.
-func (d Destination) HostEquals(other Destination) bool {
-	return d.IP == other.IP
-}
-
-// String renders a human-readable endpoint label.
-func (d Destination) String() string {
-	base := d.IP
-	if d.Port > 0 {
-		base = fmt.Sprintf("%s:%d", base, d.Port)
+func hostKeyFromIPv4String(ip string) (Host, bool) {
+	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if err != nil || !addr.Is4() {
+		return 0, false
 	}
-	if d.Protocol != "" {
-		return fmt.Sprintf("%s/%s", base, strings.ToLower(d.Protocol))
+	octets := addr.As4()
+	return Host(binary.BigEndian.Uint32(octets[:])), true
+}
+
+func hostKeyFromEndpoint(endpoint gopacket.Endpoint) (Host, bool) {
+	raw := endpoint.Raw()
+	if len(raw) != 4 {
+		return 0, false
 	}
-	return base
+	return Host(binary.BigEndian.Uint32(raw)), true
 }
 
-type destinationKey struct {
-	IP   string
-	Port uint16
+// Flow identifies a packet flow key using gopacket network and transport flows.
+type Flow struct {
+	NetworkFlow   gopacket.Flow
+	TransportFlow gopacket.Flow
 }
 
-func destinationKeyFor(destination Destination) destinationKey {
-	return destinationKey{IP: destination.IP, Port: destination.Port}
+func (f Flow) Equals(other Flow) bool {
+	return f.NetworkFlow == other.NetworkFlow && f.TransportFlow == other.TransportFlow
 }
 
-type destinationCount struct {
-	Destination Destination
-	Count       int
+func flowFromPacket(packet gopacket.Packet) (Flow, bool) {
+	if packet == nil {
+		return Flow{}, false
+	}
+
+	network := packet.NetworkLayer()
+	if network == nil {
+		return Flow{}, false
+	}
+
+	key := Flow{
+		NetworkFlow: network.NetworkFlow(),
+	}
+
+	transport := packet.TransportLayer()
+	if transport != nil {
+		switch transport.(type) {
+		case *layers.TCP, *layers.UDP:
+			key.TransportFlow = transport.TransportFlow()
+		}
+	}
+
+	return key, true
 }
 
-type destinationCounts map[destinationKey]destinationCount
+type flowCounts map[Flow]int
 
-func topDestinationByCount(destinations destinationCounts) (Destination, int) {
-	if len(destinations) == 0 {
-		return Destination{}, 0
+func topFlowByCount(flows flowCounts) (BehaviorFlow, int) {
+	if len(flows) == 0 {
+		return BehaviorFlow{}, 0
 	}
 
 	var (
-		maxDest  Destination
+		maxFlow  BehaviorFlow
 		maxCount int
 		maxLabel string
 		found    bool
 	)
 
-	for _, entry := range destinations {
-		if entry.Count <= 0 {
+	for flow, count := range flows {
+		if count <= 0 {
 			continue
 		}
-		label := entry.Destination.String()
-		if !found || entry.Count > maxCount || (entry.Count == maxCount && label < maxLabel) {
-			maxCount = entry.Count
-			maxDest = entry.Destination
+		behaviorFlow := behaviorFlowFromFlow(flow)
+		label := behaviorFlow.String()
+		if !found || count > maxCount || (count == maxCount && label < maxLabel) {
+			maxCount = count
+			maxFlow = behaviorFlow
 			maxLabel = label
 			found = true
 		}
 	}
 
 	if !found {
-		return Destination{}, 0
+		return BehaviorFlow{}, 0
 	}
 
-	return maxDest, maxCount
+	return maxFlow, maxCount
 }
 
 type packetRing struct {
@@ -129,116 +148,123 @@ func (r *packetRing) snapshot() []gopacket.Packet {
 	return out
 }
 
-func mergeDestinationCounts(acc destinationCounts, batch destinationCounts) destinationCounts {
+func mergeFlowCounts(acc flowCounts, batch flowCounts) flowCounts {
 	if len(batch) == 0 {
 		return acc
 	}
 
 	if acc == nil {
-		acc = make(destinationCounts, len(batch))
+		acc = make(flowCounts, len(batch))
 	}
 
-	for key, entry := range batch {
-		if entry.Count == 0 {
+	for key, count := range batch {
+		if count == 0 {
 			continue
 		}
-		if existing, exists := acc[key]; exists {
-			existing.Count += entry.Count
-			if existing.Destination.Protocol == "" && entry.Destination.Protocol != "" {
-				existing.Destination.Protocol = entry.Destination.Protocol
-			}
-			acc[key] = existing
-		} else {
-			acc[key] = entry
-		}
+		acc[key] += count
 	}
 
 	return acc
 }
 
-// countPacketsByDestination tallies packets overall and per destination endpoint.
-func countPacketsByDestination(
+// countPacketsByFlow tallies packets overall and per flow endpoint.
+func countPacketsByFlow(
 	pkts *[]gopacket.Packet,
-	exclude map[string]bool,
-	maxDestinations int,
-) (int, destinationCounts, error) {
+	exclude map[Host]bool,
+	maxFlows int,
+) (int, flowCounts, error) {
 	if pkts == nil || len(*pkts) == 0 {
 		return 0, nil, nil
 	}
 
-	hostCounts := make(destinationCounts, maxDestinations)
+	hostCounts := make(flowCounts, maxFlows)
 	total := 0
 
 	for _, packet := range *pkts {
 		if packet == nil {
 			continue
 		}
-		destination := destinationFromPacket(packet)
-		if destination.IP == "" {
+		key, ok := flowFromPacket(packet)
+		if !ok {
 			continue
 		}
 
-		if exclude[destination.IP] {
+		behaviorFlow := behaviorFlowFromFlow(key)
+		if !behaviorFlow.HasDstHost {
+			continue
+		}
+
+		if behaviorFlow.HasDstHost && exclude[behaviorFlow.DstHost] {
 			continue
 		}
 
 		total++
 
-		key := destinationKeyFor(destination)
-		if entry, exists := hostCounts[key]; exists {
-			entry.Count++
-			if entry.Destination.Protocol == "" && destination.Protocol != "" {
-				entry.Destination.Protocol = destination.Protocol
-			}
-			hostCounts[key] = entry
+		if _, exists := hostCounts[key]; exists {
+			hostCounts[key]++
 			continue
 		}
 
-		if len(hostCounts) >= maxDestinations {
-			return total, hostCounts, &MaxDestinationsReached{}
+		if len(hostCounts) >= maxFlows {
+			return total, hostCounts, &MaxFlowsReached{}
 		}
 
-		hostCounts[key] = destinationCount{
-			Destination: destination,
-			Count:       1,
-		}
+		hostCounts[key] = 1
 	}
 
 	return total, hostCounts, nil
 }
 
-func destinationFromPacket(packet gopacket.Packet) Destination {
-	var out Destination
-	if packet == nil {
-		return out
+func behaviorFlowFromFlow(flow Flow) BehaviorFlow {
+	var out BehaviorFlow
+
+	src := flow.NetworkFlow.Src()
+	dst := flow.NetworkFlow.Dst()
+
+	if srcHost, ok := hostKeyFromEndpoint(src); ok {
+		out.SrcHost = srcHost
+		out.HasSrcHost = true
+	}
+	if dstHost, ok := hostKeyFromEndpoint(dst); ok {
+		out.DstHost = dstHost
+		out.HasDstHost = true
 	}
 
-	if network := packet.NetworkLayer(); network != nil {
-		out.IP = network.NetworkFlow().Dst().String()
-		if out.Protocol == "" {
-			out.Protocol = strings.ToLower(network.LayerType().String())
-		}
+	if srcPort, ok := portFromEndpoint(flow.TransportFlow.Src()); ok {
+		out.SrcPort = srcPort
+	}
+	if dstPort, ok := portFromEndpoint(flow.TransportFlow.Dst()); ok {
+		out.DstPort = dstPort
 	}
 
-	if transport := packet.TransportLayer(); transport != nil {
-		switch layer := transport.(type) {
-		case *layers.TCP:
-			out.Port = uint16(layer.DstPort)
-			out.Protocol = "tcp"
-		case *layers.UDP:
-			out.Port = uint16(layer.DstPort)
-			out.Protocol = "udp"
-		case *layers.SCTP:
-			out.Port = uint16(layer.DstPort)
-			out.Protocol = "sctp"
-		default:
-			if out.Protocol == "" {
-				out.Protocol = strings.ToLower(transport.LayerType().String())
-			}
-		}
-	}
-
+	out.Protocol = protocolFromFlow(flow)
 	return out
+}
+
+func portFromEndpoint(endpoint gopacket.Endpoint) (uint16, bool) {
+	raw := endpoint.Raw()
+	if len(raw) != 2 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint16(raw), true
+}
+
+func protocolFromFlow(flow Flow) string {
+	transportType := strings.ToLower(flow.TransportFlow.EndpointType().String())
+	switch {
+	case strings.Contains(transportType, "tcp"):
+		return "tcp"
+	case strings.Contains(transportType, "udp"):
+		return "udp"
+	case strings.Contains(transportType, "sctp"):
+		return "sctp"
+	}
+
+	networkType := strings.ToLower(flow.NetworkFlow.EndpointType().String())
+	if networkType != "" && networkType != "invalidendpoint" {
+		return networkType
+	}
+	return ""
 }
 
 // getEventTime returns the timestamp of the start of the window, or of the
@@ -263,43 +289,40 @@ func getEventTime(
 	return eventTime
 }
 
-func destinationsFromCounts(destinations destinationCounts) []Destination {
-	if len(destinations) == 0 {
+func flowsFromCounts(flows flowCounts) []BehaviorFlow {
+	if len(flows) == 0 {
 		return nil
 	}
 
-	list := make([]Destination, 0, len(destinations))
+	list := make([]BehaviorFlow, 0, len(flows))
 
-	for _, entry := range destinations {
-		if entry.Destination.IP == "" {
+	for flow := range flows {
+		behaviorFlow := behaviorFlowFromFlow(flow)
+		if !behaviorFlow.HasDstHost {
 			continue
 		}
-		list = append(list, entry.Destination)
+		list = append(list, behaviorFlow)
 	}
 
 	return list
 }
 
-func uniqueHosts(destinations []Destination) []Destination {
-	if len(destinations) == 0 {
+func uniqueHosts(flows []BehaviorFlow) []BehaviorFlow {
+	if len(flows) == 0 {
 		return nil
 	}
 
-	hosts := make([]Destination, 0, len(destinations))
-	for _, destination := range destinations {
-		if destination.IP == "" {
+	hosts := make([]BehaviorFlow, 0, len(flows))
+	seenHosts := make(map[Host]struct{}, len(flows))
+	for _, flow := range flows {
+		if !flow.HasDstHost {
 			continue
 		}
-		seen := false
-		for _, host := range hosts {
-			if destination.HostEquals(host) {
-				seen = true
-				break
-			}
+		if _, exists := seenHosts[flow.DstHost]; exists {
+			continue
 		}
-		if !seen {
-			hosts = append(hosts, destination)
-		}
+		seenHosts[flow.DstHost] = struct{}{}
+		hosts = append(hosts, flow)
 	}
 
 	if len(hosts) == 0 {
@@ -309,7 +332,7 @@ func uniqueHosts(destinations []Destination) []Destination {
 	return hosts
 }
 
-func newHosts(current []Destination, previous []Destination) []Destination {
+func newHosts(current []BehaviorFlow, previous []BehaviorFlow) []BehaviorFlow {
 	if len(current) == 0 {
 		return nil
 	}
@@ -317,17 +340,20 @@ func newHosts(current []Destination, previous []Destination) []Destination {
 		return current
 	}
 
-	var out []Destination
-	for _, destination := range current {
-		seen := false
-		for _, prev := range previous {
-			if destination.HostEquals(prev) {
-				seen = true
-				break
-			}
+	seenHosts := make(map[Host]struct{}, len(previous))
+	for _, prev := range previous {
+		if prev.HasDstHost {
+			seenHosts[prev.DstHost] = struct{}{}
 		}
-		if !seen {
-			out = append(out, destination)
+	}
+
+	var out []BehaviorFlow
+	for _, flow := range current {
+		if flow.HasDstHost {
+			if _, exists := seenHosts[flow.DstHost]; exists {
+				continue
+			}
+			out = append(out, flow)
 		}
 	}
 
@@ -346,17 +372,17 @@ func computeScanRate(durationSeconds float64, hostCount int) float64 {
 	return float64(hostCount) / durationSeconds
 }
 
-func hostLabels(hosts []Destination) *[]string {
+func hostLabels(hosts []BehaviorFlow) *[]string {
 	if len(hosts) == 0 {
 		return nil
 	}
 
 	labels := make([]string, 0, len(hosts))
 	for _, host := range hosts {
-		if host.IP == "" {
+		if !host.HasDstHost {
 			continue
 		}
-		labels = append(labels, host.IP)
+		labels = append(labels, host.DstHost.String())
 	}
 
 	if len(labels) == 0 {
