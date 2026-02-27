@@ -575,6 +575,39 @@ func TestGlobalFlowIDDeterministicAgainstFlowOrder(t *testing.T) {
 	}
 }
 
+func TestCountPacketsByFlowExcludesUninterestingDestinations(t *testing.T) {
+	packets := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.200", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.200", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.201", 22),
+	}
+
+	exclude := map[Host]bool{}
+	excludedHost, ok := hostFromIPv4String("198.51.100.200")
+	if !ok {
+		t.Fatalf("failed to parse excluded host")
+	}
+	exclude[excludedHost] = true
+
+	total, counts, err := countPacketsByFlow(&packets, exclude, defaultMaxFlows)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if total != 1 {
+		t.Fatalf("expected tracked packet total 1, got %d", total)
+	}
+	if len(counts) != 1 {
+		t.Fatalf("expected one tracked flow, got %d", len(counts))
+	}
+
+	for flow := range counts {
+		behaviorFlow := behaviorFlowFromFlow(flow)
+		if behaviorFlow.DstHost == excludedHost {
+			t.Fatalf("excluded destination %s was tracked in flow counts", excludedHost.String())
+		}
+	}
+}
+
 func newTestAnalysisConfigWithC2(w io.Writer, c2 string, packetThresh, destinationThresh float64) *AnalysisConfiguration {
 	config := NewAnalysisConfiguration(
 		"10.0.0.5",
