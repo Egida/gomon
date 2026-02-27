@@ -86,9 +86,9 @@ type behaviorBase struct {
 }
 
 type BehaviorContext struct {
-	SampleID string  `json:"sample_id,omitempty"`
-	SrcIP    *string `json:"src_ip,omitempty"`
-	C2IP     *string `json:"c2_ip,omitempty"`
+	SampleID string `json:"sample_id,omitempty"`
+	BotIP    Host   `json:"bot_ip,omitempty"`
+	C2IP     Host   `json:"c2_ip,omitempty"`
 }
 
 type LocalBehavior struct {
@@ -129,14 +129,8 @@ func newBehaviorBase(
 	if context != nil {
 		ctx := &BehaviorContext{
 			SampleID: context.sampleID,
-		}
-		if context.srcHost != 0 {
-			src := context.srcHost.String()
-			ctx.SrcIP = &src
-		}
-		if context.hasC2Host {
-			c2 := context.c2Host.String()
-			ctx.C2IP = &c2
+			BotIP:    context.botHost,
+			C2IP:     context.c2Host,
 		}
 		base.Context = ctx
 	}

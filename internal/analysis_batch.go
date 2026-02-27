@@ -111,9 +111,8 @@ type batchResult struct {
 
 type AnalysisContext struct {
 	// instance configuration
-	srcHost            Host
+	botHost            Host
 	c2Host             Host
-	hasC2Host          bool
 	sampleID           string        // unique identifier to match behavior to a malware sample
 	uninterestingHosts map[Host]bool // List of IP addresses that are not interesting for analysis
 }
@@ -233,7 +232,7 @@ func NewAnalysisConfiguration(
 	filterIPs = append(filterIPs, srcIP, c2IP)
 	uninterestingIPs := map[Host]bool{}
 	srcHost, _ := hostFromIPv4String(srcIP)
-	c2Host, hasC2Host := hostFromIPv4String(c2IP)
+	c2Host, _ := hostFromIPv4String(c2IP)
 
 	for _, ip := range filterIPs {
 		if host, ok := hostFromIPv4String(ip); ok {
@@ -269,9 +268,8 @@ func NewAnalysisConfiguration(
 		captureDir:               captureDir,
 		packetRings:              buffers,
 		context: AnalysisContext{
-			srcHost:            srcHost,
+			botHost:            srcHost,
 			c2Host:             c2Host,
-			hasC2Host:          hasC2Host,
 			sampleID:           sampleID,
 			uninterestingHosts: uninterestingIPs,
 		},
@@ -512,7 +510,7 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 
 	attacked := make(map[Host]bool)
 
-	if config.context.hasC2Host && config.PacketRateThreshold > 0 {
+	if config.context.c2Host != 0 && config.PacketRateThreshold > 0 {
 		for key, count := range destinations {
 			behaviorFlow := behaviorFlowFromFlow(key)
 			if behaviorFlow.DstHost == 0 {
@@ -708,7 +706,7 @@ func (config *AnalysisConfiguration) classifyLocalBehavior(
 	)
 
 	// attacks can only occur if a C2 IP is specified (assumed)
-	if config != nil && config.context.hasC2Host && packetRate > config.PacketRateThreshold {
+	if config != nil && config.context.c2Host != 0 && packetRate > config.PacketRateThreshold {
 		return NewLocalBehavior(
 			Attack,
 			eventTime,

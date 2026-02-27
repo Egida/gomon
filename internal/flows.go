@@ -26,7 +26,32 @@ func (h Host) String() string {
 }
 
 func (h Host) MarshalJSON() ([]byte, error) {
+	if h == 0 {
+		return []byte("null"), nil
+	}
 	return json.Marshal(h.String())
+}
+
+func (h *Host) UnmarshalJSON(data []byte) error {
+	if h == nil {
+		return nil
+	}
+	if string(data) == "null" {
+		*h = 0
+		return nil
+	}
+
+	var ip string
+	if err := json.Unmarshal(data, &ip); err != nil {
+		return err
+	}
+	host, ok := hostFromIPv4String(ip)
+	if !ok {
+		*h = 0
+		return nil
+	}
+	*h = host
+	return nil
 }
 
 func hostFromIPv4String(ip string) (Host, bool) {

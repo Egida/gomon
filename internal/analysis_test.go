@@ -59,7 +59,7 @@ func TestEveAttackFormatting(t *testing.T) {
 		t.Fatalf("expected gomon to be defined, but got 'nil'")
 	}
 
-	if gomon.Context == nil || gomon.Context.C2IP == nil || *gomon.Context.C2IP != "203.0.113.50" {
+	if gomon.Context == nil || gomon.Context.C2IP.String() != "203.0.113.50" {
 		t.Fatalf("expected gomon.context.c2_ip 203.0.113.50, got %#v", gomon)
 	}
 	if gomon.PacketThreshold != 1 {
@@ -93,11 +93,11 @@ func TestAttackWithSpoofedSourceIP(t *testing.T) {
 	if attack.SrcIP == "10.0.0.5" {
 		t.Fatalf("expected attack SrcIP to differ from context source 10.0.0.5, got %s", attack.SrcIP)
 	}
-	if attack.Gomon == nil || attack.Gomon.Context == nil || attack.Gomon.Context.SrcIP == nil {
-		t.Fatalf("expected gomon.context.src_ip to be present, got %#v", attack.Gomon)
+	if attack.Gomon == nil || attack.Gomon.Context == nil {
+		t.Fatalf("expected gomon.context.bot_ip to be present, got %#v", attack.Gomon)
 	}
-	if *attack.Gomon.Context.SrcIP != "10.0.0.5" {
-		t.Fatalf("expected gomon.context.src_ip 10.0.0.5, got %s", *attack.Gomon.Context.SrcIP)
+	if attack.Gomon.Context.BotIP.String() != "10.0.0.5" {
+		t.Fatalf("expected gomon.context.bot_ip 10.0.0.5, got %s", attack.Gomon.Context.BotIP.String())
 	}
 }
 
@@ -130,7 +130,7 @@ func TestEveScanFormatting(t *testing.T) {
 	}
 
 	gomon := scan.Gomon
-	if gomon == nil || gomon.Context == nil || gomon.Context.C2IP == nil || *gomon.Context.C2IP != "203.0.113.50" {
+	if gomon == nil || gomon.Context == nil || gomon.Context.C2IP.String() != "203.0.113.50" {
 		t.Fatalf("expected gomon.context.c2_ip 203.0.113.50, got %#v", gomon)
 	}
 	if gomon.DestinationRate < 3 {
