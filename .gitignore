@@ -2,3 +2,4 @@
 *.jsonl
 .DS_Store
 *.pcap
+.gocache

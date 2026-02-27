@@ -203,7 +203,7 @@ func uniqueHosts(flows []BehaviorFlow) []BehaviorFlow {
 	return hosts
 }
 
-func newHosts(current []BehaviorFlow, previous []BehaviorFlow) []BehaviorFlow {
+func newHosts(current []BehaviorFlow, previous map[Host]bool) []BehaviorFlow {
 	if len(current) == 0 {
 		return nil
 	}
@@ -211,17 +211,10 @@ func newHosts(current []BehaviorFlow, previous []BehaviorFlow) []BehaviorFlow {
 		return current
 	}
 
-	seenHosts := make(map[Host]struct{}, len(previous))
-	for _, prev := range previous {
-		if prev.DstHost != 0 {
-			seenHosts[prev.DstHost] = struct{}{}
-		}
-	}
-
 	var out []BehaviorFlow
 	for _, flow := range current {
 		if flow.DstHost != 0 {
-			if _, exists := seenHosts[flow.DstHost]; exists {
+			if previous[flow.DstHost] {
 				continue
 			}
 			out = append(out, flow)
@@ -232,6 +225,20 @@ func newHosts(current []BehaviorFlow, previous []BehaviorFlow) []BehaviorFlow {
 		return nil
 	}
 
+	return out
+}
+
+func hostsFromFlows(flows []BehaviorFlow) map[Host]bool {
+	out := make(map[Host]bool, len(flows))
+
+	for _, flow := range flows {
+		if flow.DstHost != 0 {
+			out[flow.DstHost] = true
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
 	return out
 }
 

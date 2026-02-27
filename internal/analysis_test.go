@@ -380,6 +380,201 @@ func TestMultiPortSingleHostDoesNotTriggerScan(t *testing.T) {
 	}
 }
 
+func TestLocalFlowIDReusedAcrossConsecutiveWindows(t *testing.T) {
+	buf := &bytes.Buffer{}
+	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 1, 100)
+	now := time.Now()
+
+	first := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.10", 8080),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.10", 8080),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.10", 8080),
+	}
+	second := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.10", 8080),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.10", 8080),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.10", 8080),
+	}
+
+	config.ProcessBatch(nil, first, now)
+	config.flushResults()
+	config.ProcessBatch(nil, second, now.Add(time.Second))
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+	attacks := findEventsByCategory(events, "attack")
+	if len(attacks) != 2 {
+		t.Fatalf("expected 2 attack events, got %d (%v)", len(attacks), events)
+	}
+	if attacks[0].FlowID == 0 || attacks[1].FlowID == 0 {
+		t.Fatalf("expected non-zero flow IDs, got %d and %d", attacks[0].FlowID, attacks[1].FlowID)
+	}
+	if attacks[0].FlowID != attacks[1].FlowID {
+		t.Fatalf("expected matching flow IDs for consecutive identical behavior, got %d and %d", attacks[0].FlowID, attacks[1].FlowID)
+	}
+}
+
+func TestLocalFlowIDChangesWhenClassificationChanges(t *testing.T) {
+	buf := &bytes.Buffer{}
+	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 2, 100)
+	now := time.Now()
+
+	// Window 1: packetRate == threshold, so this remains outbound_connection.
+	outbound := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.20", 9001),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.20", 9001),
+	}
+	// Window 2: packetRate > threshold, same flow now becomes attack.
+	attack := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.20", 9001),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.20", 9001),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.20", 9001),
+	}
+
+	config.ProcessBatch(nil, outbound, now)
+	config.flushResults()
+	config.ProcessBatch(nil, attack, now.Add(time.Second))
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+	if len(events) != 2 {
+		t.Fatalf("expected 2 local events, got %d (%v)", len(events), events)
+	}
+	if events[0].Alert == nil || events[0].Alert.Category != "connection" {
+		t.Fatalf("expected first event to be connection, got %#v", events[0])
+	}
+	if events[1].Alert == nil || events[1].Alert.Category != "attack" {
+		t.Fatalf("expected second event to be attack, got %#v", events[1])
+	}
+	if events[0].FlowID == events[1].FlowID {
+		t.Fatalf("expected different flow IDs when classification changes, got %d", events[0].FlowID)
+	}
+}
+
+func TestLocalFlowIDDoesNotCarryAcrossGap(t *testing.T) {
+	buf := &bytes.Buffer{}
+	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 1, 100)
+	now := time.Now()
+
+	attack := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.30", 8080),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.30", 8080),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.30", 8080),
+	}
+
+	config.ProcessBatch(nil, attack, now)
+	config.flushResults()
+
+	// Gap window: no behavior emitted.
+	config.ProcessBatch(nil, []gopacket.Packet{}, now.Add(time.Second))
+	config.flushResults()
+
+	config.ProcessBatch(nil, attack, now.Add(2*time.Second))
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+	attacks := findEventsByCategory(events, "attack")
+	if len(attacks) != 2 {
+		t.Fatalf("expected 2 attack events across gap scenario, got %d (%v)", len(attacks), events)
+	}
+	if attacks[0].FlowID == attacks[1].FlowID {
+		t.Fatalf("expected different flow IDs across non-adjacent windows, got %d", attacks[0].FlowID)
+	}
+}
+
+func TestGlobalFlowIDReusedAcrossConsecutiveEquivalentScans(t *testing.T) {
+	buf := &bytes.Buffer{}
+	config := newTestAnalysisConfigWithC2(buf, "", 100, 2)
+	now := time.Now()
+
+	first := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.40", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.41", 23),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.42", 80),
+	}
+	second := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.40", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.41", 23),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.42", 80),
+	}
+
+	config.ProcessBatch(nil, first, now)
+	config.flushResults()
+	config.ProcessBatch(nil, second, now.Add(time.Second))
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+	scans := findEventsByCategory(events, "scan")
+	if len(scans) != 2 {
+		t.Fatalf("expected 2 scan events, got %d (%v)", len(scans), events)
+	}
+	if scans[0].FlowID != scans[1].FlowID {
+		t.Fatalf("expected equal flow IDs for equivalent consecutive scans, got %d and %d", scans[0].FlowID, scans[1].FlowID)
+	}
+}
+
+func TestGlobalFlowIDChangesWhenScanSetChanges(t *testing.T) {
+	buf := &bytes.Buffer{}
+	config := newTestAnalysisConfigWithC2(buf, "", 100, 2)
+	now := time.Now()
+
+	first := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.50", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.51", 23),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.52", 80),
+	}
+	second := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.50", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.51", 23),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.53", 80),
+	}
+
+	config.ProcessBatch(nil, first, now)
+	config.flushResults()
+	config.ProcessBatch(nil, second, now.Add(time.Second))
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+	scans := findEventsByCategory(events, "scan")
+	if len(scans) != 2 {
+		t.Fatalf("expected 2 scan events, got %d (%v)", len(scans), events)
+	}
+	if scans[0].FlowID == scans[1].FlowID {
+		t.Fatalf("expected different flow IDs when scan set changes, got %d", scans[0].FlowID)
+	}
+}
+
+func TestGlobalFlowIDDeterministicAgainstFlowOrder(t *testing.T) {
+	buf := &bytes.Buffer{}
+	config := newTestAnalysisConfigWithC2(buf, "", 100, 2)
+	now := time.Now()
+
+	first := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.60", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.61", 23),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.62", 80),
+	}
+	second := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.62", 80),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.60", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.61", 23),
+	}
+
+	config.ProcessBatch(nil, first, now)
+	config.flushResults()
+	config.ProcessBatch(nil, second, now.Add(time.Second))
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+	scans := findEventsByCategory(events, "scan")
+	if len(scans) != 2 {
+		t.Fatalf("expected 2 scan events, got %d (%v)", len(scans), events)
+	}
+	if scans[0].FlowID != scans[1].FlowID {
+		t.Fatalf("expected order-independent scan flow IDs, got %d and %d", scans[0].FlowID, scans[1].FlowID)
+	}
+}
+
 func newTestAnalysisConfigWithC2(w io.Writer, c2 string, packetThresh, destinationThresh float64) *AnalysisConfiguration {
 	config := NewAnalysisConfiguration(
 		"10.0.0.5",

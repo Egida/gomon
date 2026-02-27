@@ -1,7 +1,10 @@
 package internal
 
 import (
+	"encoding/binary"
 	"fmt"
+	"hash/fnv"
+	"sort"
 	"strings"
 	"time"
 )
@@ -32,6 +35,12 @@ type BehaviorFlow struct {
 	Protocol string `json:"protocol,omitempty"`
 	SrcHost  Host   `json:"src_host,omitempty"`
 	DstHost  Host   `json:"dst_host,omitempty"`
+}
+
+// behaviorKey identifies behavior by class and normalized flow hash.
+type behaviorKey struct {
+	Classification BehaviorClass
+	FlowHash       uint64
 }
 
 // Equals returns true when two behavior flows represent the same 5-tuple
@@ -71,6 +80,78 @@ func (f BehaviorFlow) String() string {
 	return base
 }
 
+func newBehaviorKeyFromLocalBehavior(behavior *LocalBehavior) behaviorKey {
+	if behavior == nil {
+		return behaviorKey{}
+	}
+	return behaviorKey{
+		Classification: behavior.Classification,
+		FlowHash:       hashBehaviorFlows([]BehaviorFlow{behavior.Flow}),
+	}
+}
+
+func newBehaviorKeyFromGlobalBehavior(behavior *GlobalBehavior) behaviorKey {
+	if behavior == nil {
+		return behaviorKey{}
+	}
+	return behaviorKey{
+		Classification: behavior.Classification,
+		FlowHash:       hashBehaviorFlows(behavior.Flows),
+	}
+}
+
+func hashBehaviorFlows(flows []BehaviorFlow) uint64 {
+	if len(flows) == 0 {
+		return 0
+	}
+
+	normalized := make([]BehaviorFlow, len(flows))
+	copy(normalized, flows)
+	for i := range normalized {
+		normalized[i].Protocol = strings.ToLower(strings.TrimSpace(normalized[i].Protocol))
+	}
+
+	sort.Slice(normalized, func(i, j int) bool {
+		if normalized[i].SrcHost != normalized[j].SrcHost {
+			return normalized[i].SrcHost < normalized[j].SrcHost
+		}
+		if normalized[i].SrcPort != normalized[j].SrcPort {
+			return normalized[i].SrcPort < normalized[j].SrcPort
+		}
+		if normalized[i].DstHost != normalized[j].DstHost {
+			return normalized[i].DstHost < normalized[j].DstHost
+		}
+		if normalized[i].DstPort != normalized[j].DstPort {
+			return normalized[i].DstPort < normalized[j].DstPort
+		}
+		return normalized[i].Protocol < normalized[j].Protocol
+	})
+
+	hasher := fnv.New64a()
+	for _, flow := range normalized {
+		var srcHost [4]byte
+		binary.BigEndian.PutUint32(srcHost[:], uint32(flow.SrcHost))
+		_, _ = hasher.Write(srcHost[:])
+
+		var srcPort [2]byte
+		binary.BigEndian.PutUint16(srcPort[:], flow.SrcPort)
+		_, _ = hasher.Write(srcPort[:])
+
+		var dstHost [4]byte
+		binary.BigEndian.PutUint32(dstHost[:], uint32(flow.DstHost))
+		_, _ = hasher.Write(dstHost[:])
+
+		var dstPort [2]byte
+		binary.BigEndian.PutUint16(dstPort[:], flow.DstPort)
+		_, _ = hasher.Write(dstPort[:])
+
+		_, _ = hasher.Write([]byte(flow.Protocol))
+		_, _ = hasher.Write([]byte{0})
+	}
+
+	return hasher.Sum64()
+}
+
 type behaviorBase struct {
 	Classification BehaviorClass `json:"classification"`
 	Scope          BehaviorScope `json:"scope"`      // Indicates the scope of the behavior (global/local)
@@ -83,6 +164,9 @@ type behaviorBase struct {
 
 	Context *BehaviorContext `json:"context,omitempty"`
 	context *AnalysisContext `json:"-"`
+
+	// assignedFlowID is set by analysis batching to preserve continuity across adjacent windows.
+	assignedFlowID uint64 `json:"-"`
 }
 
 type BehaviorContext struct {

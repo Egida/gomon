@@ -99,7 +99,11 @@ func (l *EveLogger) LogGlobalBehavior(behavior *GlobalBehavior) error {
 func localBehaviorToEveEvent(behavior *LocalBehavior) *EveEvent {
 	base := &behavior.behaviorBase
 	event := baseToEvent(base)
-	event.FlowID = flowIDFromLocalBehavior(behavior)
+	if base.assignedFlowID != 0 {
+		event.FlowID = base.assignedFlowID
+	} else {
+		event.FlowID = flowIDFromLocalBehavior(behavior)
+	}
 	event.Alert = newEveAlert(base.Classification)
 	event.Stats = newEveStats(base)
 	event.Metadata = eventMetadataFromLocalBehavior(behavior)
@@ -128,7 +132,11 @@ func localBehaviorToEveEvent(behavior *LocalBehavior) *EveEvent {
 func globalBehaviorToEveEvent(behavior *GlobalBehavior) *EveEvent {
 	base := &behavior.behaviorBase
 	event := baseToEvent(base)
-	event.FlowID = flowIDFromGlobalBehavior(behavior)
+	if base.assignedFlowID != 0 {
+		event.FlowID = base.assignedFlowID
+	} else {
+		event.FlowID = flowIDFromGlobalBehavior(behavior)
+	}
 	event.Alert = newEveAlert(base.Classification)
 	event.Stats = newEveStats(base)
 	event.Metadata = eventMetadataFromGlobalBehavior(behavior)

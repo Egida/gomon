@@ -1,6 +1,8 @@
 package internal
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -36,11 +38,13 @@ type AnalysisConfiguration struct {
 	logger      *slog.Logger
 	eventLogger *EveLogger
 
-	result            batchResult
-	packetRings       map[Flow]*packetRing
-	summary           AnalysisSummary
-	captureBehavior   func(*AnalysisConfiguration, *LocalBehavior) (bool, error)
-	previousScanHosts []BehaviorFlow
+	result              batchResult
+	packetRings         map[Flow]*packetRing
+	summary             AnalysisSummary
+	captureBehavior     func(*AnalysisConfiguration, *LocalBehavior) (bool, error)
+	previousLocalIDs    map[behaviorKey]uint64
+	previousGlobalIDs   map[behaviorKey]uint64
+	previousWindowHosts map[Host]bool
 
 	// static context for logging
 	context AnalysisContext
@@ -273,8 +277,11 @@ func NewAnalysisConfiguration(
 			sampleID:           sampleID,
 			uninterestingHosts: uninterestingIPs,
 		},
-		captureBehavior: captureBehavior,
-		maxFlows:        defaultMaxFlows,
+		captureBehavior:     captureBehavior,
+		maxFlows:            defaultMaxFlows,
+		previousLocalIDs:    make(map[behaviorKey]uint64),
+		previousGlobalIDs:   make(map[behaviorKey]uint64),
+		previousWindowHosts: make(map[Host]bool),
 	}
 }
 
@@ -378,6 +385,9 @@ func (config *AnalysisConfiguration) snapshotFlowPackets(key Flow) []gopacket.Pa
 
 func (config *AnalysisConfiguration) flushResults() {
 	if config.result.globalPacketCount == 0 && len(config.result.flowPacketCounts) == 0 {
+		config.previousLocalIDs = nil
+		config.previousGlobalIDs = nil
+		config.previousWindowHosts = nil
 		return
 	}
 	if config.result.windowStart.IsZero() {
@@ -397,6 +407,9 @@ func (config *AnalysisConfiguration) flushResults() {
 	windowEnd := config.result.windowStart.Add(windowDuration)
 
 	if config.calibrate {
+		config.previousLocalIDs = nil
+		config.previousGlobalIDs = nil
+		config.previousWindowHosts = nil
 		config.logCalibration(windowEnd, durationSeconds)
 		return
 	}
@@ -429,9 +442,9 @@ func (config *AnalysisConfiguration) flushResults() {
 	scanHosts := uniqueHosts(scanDestinations)
 	scanTargets := scanHosts
 	if config.scanDetectionMode == ScanDetectionNewHostRate {
-		scanTargets = newHosts(scanHosts, config.previousScanHosts)
+		scanTargets = newHosts(scanHosts, config.previousWindowHosts)
 	}
-	config.previousScanHosts = scanHosts
+	config.previousWindowHosts = hostsFromFlows(scanHosts)
 
 	config.logger.Debug(
 		"Flushing results",
@@ -457,7 +470,13 @@ func (config *AnalysisConfiguration) flushResults() {
 		scanTargets,
 		config.result.windowStart,
 	)
-	config.logGlobalBehavior(globalBehavior)
+	currentLocalIDs := make(map[behaviorKey]uint64)
+	currentGlobalIDs := make(map[behaviorKey]uint64)
+
+	if config.shouldEmitGlobalBehavior(globalBehavior) {
+		config.assignGlobalBehaviorFlowID(globalBehavior, currentGlobalIDs)
+		config.logGlobalBehavior(globalBehavior)
+	}
 
 	// then log local behavior
 	capturedFlows := make(map[Flow]struct{})
@@ -466,6 +485,7 @@ func (config *AnalysisConfiguration) flushResults() {
 		if !config.shouldLogLocalBehavior(globalBehavior, localBehavior) {
 			continue
 		}
+		config.assignLocalBehaviorFlowID(localBehavior, currentLocalIDs)
 		var captured []gopacket.Packet
 		captureKey := local.key
 
@@ -482,6 +502,8 @@ func (config *AnalysisConfiguration) flushResults() {
 		config.logLocalBehavior(localBehavior, captured)
 	}
 
+	config.previousLocalIDs = currentLocalIDs
+	config.previousGlobalIDs = currentGlobalIDs
 }
 
 func (config *AnalysisConfiguration) resetWindowState() {
@@ -531,9 +553,9 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 	scanHosts := uniqueHosts(flowsFromCounts(scanCounts))
 	scanTargets := scanHosts
 	if config.scanDetectionMode == ScanDetectionNewHostRate {
-		scanTargets = newHosts(scanHosts, config.previousScanHosts)
+		scanTargets = newHosts(scanHosts, config.previousWindowHosts)
 	}
-	config.previousScanHosts = scanHosts
+	config.previousWindowHosts = hostsFromFlows(scanHosts)
 
 	scanRate := computeScanRate(durationSeconds, len(scanTargets))
 
@@ -734,6 +756,77 @@ func (config *AnalysisConfiguration) shouldLogLocalBehavior(globalBehavior *Glob
 		return true
 	}
 	return !(globalBehavior.Classification == Scan && localBehavior.Classification == OutboundConnection)
+}
+
+func (config *AnalysisConfiguration) shouldEmitGlobalBehavior(behavior *GlobalBehavior) bool {
+	if behavior == nil {
+		return false
+	}
+	switch behavior.Classification {
+	case Scan:
+		return true
+	case Idle:
+		return config.showIdle
+	default:
+		return false
+	}
+}
+
+func (config *AnalysisConfiguration) assignLocalBehaviorFlowID(
+	behavior *LocalBehavior,
+	current map[behaviorKey]uint64,
+) {
+	if behavior == nil {
+		return
+	}
+	key := newBehaviorKeyFromLocalBehavior(behavior)
+	if id, ok := current[key]; ok {
+		behavior.assignedFlowID = id
+		return
+	}
+	if id, ok := config.previousLocalIDs[key]; ok {
+		behavior.assignedFlowID = id
+		current[key] = id
+		return
+	}
+	id := randomFlowID()
+	behavior.assignedFlowID = id
+	current[key] = id
+}
+
+func (config *AnalysisConfiguration) assignGlobalBehaviorFlowID(
+	behavior *GlobalBehavior,
+	current map[behaviorKey]uint64,
+) {
+	if behavior == nil {
+		return
+	}
+	key := newBehaviorKeyFromGlobalBehavior(behavior)
+	if id, ok := current[key]; ok {
+		behavior.assignedFlowID = id
+		return
+	}
+	if id, ok := config.previousGlobalIDs[key]; ok {
+		behavior.assignedFlowID = id
+		current[key] = id
+		return
+	}
+	id := randomFlowID()
+	behavior.assignedFlowID = id
+	current[key] = id
+}
+
+func randomFlowID() uint64 {
+	for {
+		var b [8]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			continue
+		}
+		id := binary.BigEndian.Uint64(b[:])
+		if id != 0 {
+			return id
+		}
+	}
 }
 
 func (config *AnalysisConfiguration) classifyGlobalBehavior(
