@@ -57,15 +57,11 @@ type EveFlowStats struct {
 // EveDetails keeps gomon specific metadata grouped under a dedicated object.
 type EveDetails struct {
 	Scope                    BehaviorScope    `json:"scope,omitempty"`
-	C2IP                     *string          `json:"c2_ip,omitempty"`
 	Context                  *BehaviorContext `json:"context,omitempty"`
-	SrcPort                  *uint16          `json:"src_port,omitempty"`
 	PacketRate               float64          `json:"packet_rate,omitempty"`
 	PacketThreshold          float64          `json:"packet_threshold,omitempty"`
 	DestinationRate          float64          `json:"destination_rate,omitempty"`
 	DestinationRateThreshold float64          `json:"destination_rate_threshold,omitempty"`
-	DestPort                 *uint16          `json:"dest_port,omitempty"`
-	Proto                    string           `json:"proto,omitempty"`
 }
 
 func NewEveLogger(w io.Writer) *EveLogger {
@@ -222,19 +218,6 @@ func eventMetadataFromLocalBehavior(behavior *LocalBehavior) map[string]any {
 		PacketThreshold:          base.PacketThreshold,
 		DestinationRate:          base.DestinationRate,
 		DestinationRateThreshold: base.DestinationRateThreshold,
-		Proto:                    behavior.Flow.Protocol,
-	}
-	if base.context != nil && base.context.hasC2Host {
-		c2 := base.context.c2Host.String()
-		d.C2IP = &c2
-	}
-	if behavior.Flow.SrcPort > 0 {
-		srcPort := behavior.Flow.SrcPort
-		d.SrcPort = &srcPort
-	}
-	if behavior.Flow.DstPort > 0 {
-		port := behavior.Flow.DstPort
-		d.DestPort = &port
 	}
 	return map[string]any{"gomon": d}
 }
@@ -251,10 +234,6 @@ func eventMetadataFromGlobalBehavior(behavior *GlobalBehavior) map[string]any {
 		PacketThreshold:          base.PacketThreshold,
 		DestinationRate:          base.DestinationRate,
 		DestinationRateThreshold: base.DestinationRateThreshold,
-	}
-	if base.context != nil && base.context.hasC2Host {
-		c2 := base.context.c2Host.String()
-		d.C2IP = &c2
 	}
 	return map[string]any{"gomon": d}
 }

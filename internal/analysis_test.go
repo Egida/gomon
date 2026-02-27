@@ -54,11 +54,13 @@ func TestEveAttackFormatting(t *testing.T) {
 	}
 
 	gomon := attack.Gomon
-	if gomon == nil || gomon.C2IP == nil || *gomon.C2IP != "203.0.113.50" {
-		t.Fatalf("expected gomon.c2_ip 203.0.113.50, got %#v", gomon)
+
+	if gomon == nil {
+		t.Fatalf("expected gomon to be defined, but got 'nil'")
 	}
-	if gomon.SrcPort == nil || *gomon.SrcPort != 40000 {
-		t.Fatalf("expected gomon.src_port 40000, got %#v", gomon)
+
+	if gomon.Context == nil || gomon.Context.C2IP == nil || *gomon.Context.C2IP != "203.0.113.50" {
+		t.Fatalf("expected gomon.context.c2_ip 203.0.113.50, got %#v", gomon)
 	}
 	if gomon.PacketThreshold != 1 {
 		t.Fatalf("expected packet_threshold 1, got %v", gomon.PacketThreshold)
@@ -91,6 +93,12 @@ func TestAttackWithSpoofedSourceIP(t *testing.T) {
 	if attack.SrcIP == "10.0.0.5" {
 		t.Fatalf("expected attack SrcIP to differ from context source 10.0.0.5, got %s", attack.SrcIP)
 	}
+	if attack.Gomon == nil || attack.Gomon.Context == nil || attack.Gomon.Context.SrcIP == nil {
+		t.Fatalf("expected gomon.context.src_ip to be present, got %#v", attack.Gomon)
+	}
+	if *attack.Gomon.Context.SrcIP != "10.0.0.5" {
+		t.Fatalf("expected gomon.context.src_ip 10.0.0.5, got %s", *attack.Gomon.Context.SrcIP)
+	}
 }
 
 func TestEveScanFormatting(t *testing.T) {
@@ -122,8 +130,8 @@ func TestEveScanFormatting(t *testing.T) {
 	}
 
 	gomon := scan.Gomon
-	if gomon == nil || gomon.C2IP == nil || *gomon.C2IP != "203.0.113.50" {
-		t.Fatalf("expected gomon.c2_ip 203.0.113.50, got %#v", gomon)
+	if gomon == nil || gomon.Context == nil || gomon.Context.C2IP == nil || *gomon.Context.C2IP != "203.0.113.50" {
+		t.Fatalf("expected gomon.context.c2_ip 203.0.113.50, got %#v", gomon)
 	}
 	if gomon.DestinationRate < 3 {
 		t.Fatalf("expected destination_rate >= 3, got %v", gomon.DestinationRate)
@@ -399,43 +407,8 @@ func newTestAnalysisConfigWithC2(w io.Writer, c2 string, packetThresh, destinati
 }
 
 type parsedEveEvent struct {
-	EventType string        `json:"event_type"`
-	Host      string        `json:"host"`
-	SrcIP     string        `json:"src_ip"`
-	SrcPort   uint16        `json:"src_port"`
-	DestIP    string        `json:"dest_ip"`
-	DestPort  uint16        `json:"dest_port"`
-	Proto     string        `json:"proto"`
-	Alert     *parsedAlert  `json:"alert"`
-	Gomon     *parsedGomon  `json:"gomon"`
-	Metadata  metadataUnion `json:"metadata"`
-}
-
-type metadataUnion map[string]json.RawMessage
-
-func (m *metadataUnion) UnmarshalJSON(data []byte) error {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
-	}
-	*m = raw
-	return nil
-}
-
-type parsedAlert struct {
-	Category  string `json:"category"`
-	Signature string `json:"signature"`
-}
-
-type parsedGomon struct {
-	C2IP                     *string `json:"c2_ip"`
-	SrcPort                  *uint16 `json:"src_port"`
-	PacketRate               float64 `json:"packet_rate"`
-	PacketThreshold          float64 `json:"packet_threshold"`
-	DestinationRate          float64 `json:"destination_rate"`
-	DestinationRateThreshold float64 `json:"destination_rate_threshold"`
-	DestPort                 *uint16 `json:"dest_port"`
-	Proto                    string  `json:"proto"`
+	EveEvent
+	Gomon *EveDetails
 }
 
 func parseEveEvents(t *testing.T, data []byte) []parsedEveEvent {
@@ -448,15 +421,21 @@ func parseEveEvents(t *testing.T, data []byte) []parsedEveEvent {
 			continue
 		}
 		var ev parsedEveEvent
-		if err := json.Unmarshal(line, &ev); err != nil {
+		if err := json.Unmarshal(line, &ev.EveEvent); err != nil {
 			t.Fatalf("failed to unmarshal eve event: %v (line: %s)", err, line)
 		}
-		if gomonRaw, ok := ev.Metadata["gomon"]; ok && len(gomonRaw) > 0 {
-			var gm parsedGomon
-			if err := json.Unmarshal(gomonRaw, &gm); err != nil {
-				t.Fatalf("failed to unmarshal gomon metadata: %v", err)
+		if ev.Metadata != nil {
+			if gomonRaw, ok := ev.Metadata["gomon"]; ok {
+				rawJSON, err := json.Marshal(gomonRaw)
+				if err != nil {
+					t.Fatalf("failed to marshal gomon metadata: %v", err)
+				}
+				var gm EveDetails
+				if err := json.Unmarshal(rawJSON, &gm); err != nil {
+					t.Fatalf("failed to unmarshal gomon metadata: %v", err)
+				}
+				ev.Gomon = &gm
 			}
-			ev.Gomon = &gm
 		}
 		events = append(events, ev)
 	}
