@@ -37,12 +37,6 @@ type BehaviorFlow struct {
 	DstHost  Host   `json:"dst_host,omitempty"`
 }
 
-// behaviorKey identifies behavior by class and normalized flow hash.
-type behaviorKey struct {
-	Classification BehaviorClass
-	FlowHash       uint64
-}
-
 // Equals returns true when two behavior flows represent the same 5-tuple
 // (source host/port, destination host/port, protocol).
 func (f BehaviorFlow) Equals(other BehaviorFlow) bool {
@@ -80,85 +74,49 @@ func (f BehaviorFlow) String() string {
 	return base
 }
 
-func newBehaviorKeyFromLocalBehavior(behavior *LocalBehavior) behaviorKey {
-	if behavior == nil {
+func (b *behaviorBase) setFlowID(id uint64) { b.assignedFlowID = id }
+
+func (b *LocalBehavior) key() behaviorKey {
+	if b == nil {
 		return behaviorKey{}
 	}
+
 	return behaviorKey{
-		Classification: behavior.Classification,
-		FlowHash:       hashBehaviorFlows([]BehaviorFlow{behavior.Flow}),
+		Classification: b.Classification,
+		FlowHash:       hashBehaviorFlows([]BehaviorFlow{b.Flow}),
 	}
 }
 
-func newBehaviorKeyFromGlobalBehavior(behavior *GlobalBehavior) behaviorKey {
-	if behavior == nil {
+func (b *GlobalBehavior) key() behaviorKey {
+	if b == nil {
 		return behaviorKey{}
 	}
+
 	return behaviorKey{
-		Classification: behavior.Classification,
-		FlowHash:       hashBehaviorFlows(behavior.Flows),
+		Classification: b.Classification,
+		FlowHash:       hashBehaviorFlows(b.Flows),
 	}
 }
 
-func hashBehaviorFlows(flows []BehaviorFlow) uint64 {
-	if len(flows) == 0 {
-		return 0
+func (f BehaviorFlow) canonical() BehaviorFlow {
+	if f.DstHost < f.SrcHost || (f.DstHost == f.SrcHost && f.DstPort < f.SrcPort) {
+		f.SrcHost, f.DstHost = f.DstHost, f.SrcHost
+		f.SrcPort, f.DstPort = f.DstPort, f.SrcPort
 	}
-
-	normalized := make([]BehaviorFlow, len(flows))
-	copy(normalized, flows)
-	for i := range normalized {
-		normalized[i] = canonicalBehaviorFlow(normalized[i])
-		normalized[i].Protocol = strings.ToLower(strings.TrimSpace(normalized[i].Protocol))
-	}
-
-	sort.Slice(normalized, func(i, j int) bool {
-		if normalized[i].SrcHost != normalized[j].SrcHost {
-			return normalized[i].SrcHost < normalized[j].SrcHost
-		}
-		if normalized[i].SrcPort != normalized[j].SrcPort {
-			return normalized[i].SrcPort < normalized[j].SrcPort
-		}
-		if normalized[i].DstHost != normalized[j].DstHost {
-			return normalized[i].DstHost < normalized[j].DstHost
-		}
-		if normalized[i].DstPort != normalized[j].DstPort {
-			return normalized[i].DstPort < normalized[j].DstPort
-		}
-		return normalized[i].Protocol < normalized[j].Protocol
-	})
-
-	hasher := fnv.New64a()
-	for _, flow := range normalized {
-		var srcHost [4]byte
-		binary.BigEndian.PutUint32(srcHost[:], uint32(flow.SrcHost))
-		_, _ = hasher.Write(srcHost[:])
-
-		var srcPort [2]byte
-		binary.BigEndian.PutUint16(srcPort[:], flow.SrcPort)
-		_, _ = hasher.Write(srcPort[:])
-
-		var dstHost [4]byte
-		binary.BigEndian.PutUint32(dstHost[:], uint32(flow.DstHost))
-		_, _ = hasher.Write(dstHost[:])
-
-		var dstPort [2]byte
-		binary.BigEndian.PutUint16(dstPort[:], flow.DstPort)
-		_, _ = hasher.Write(dstPort[:])
-
-		_, _ = hasher.Write([]byte(flow.Protocol))
-		_, _ = hasher.Write([]byte{0})
-	}
-
-	return hasher.Sum64()
+	return f
 }
 
-func canonicalBehaviorFlow(flow BehaviorFlow) BehaviorFlow {
-	if flow.DstHost < flow.SrcHost || (flow.DstHost == flow.SrcHost && flow.DstPort < flow.SrcPort) {
-		flow.SrcHost, flow.DstHost = flow.DstHost, flow.SrcHost
-		flow.SrcPort, flow.DstPort = flow.DstPort, flow.SrcPort
-	}
-	return flow
+// behaviorKey identifies behavior by class and normalized flow hash.
+type behaviorKey struct {
+	Classification BehaviorClass
+	FlowHash       uint64
+}
+
+// behavior is implemented by LocalBehavior and GlobalBehavior to support
+// unified flow ID assignment.
+type behavior interface {
+	key() behaviorKey
+	setFlowID(id uint64)
 }
 
 type behaviorBase struct {
@@ -293,4 +251,134 @@ func NewGlobalBehavior(
 		behaviorBase: base,
 		Flows:        out,
 	}
+}
+
+// classificationConfig holds the subset of AnalysisConfiguration needed to
+// construct and classify a behavior from a flow observation.
+type classificationConfig struct {
+	packetThreshold      float64
+	destinationThreshold float64
+	context              *AnalysisContext
+}
+
+// newLocalBehaviorFromFlow constructs a fully-populated LocalBehavior for the
+// given canonical flow and its window statistics, handling orientation,
+// classification, and directional rate computation in a single step.
+func newLocalBehaviorFromFlow(
+	flow Flow,
+	stats normalizedFlowStats,
+	eventTime time.Time,
+	durationSeconds float64,
+	cfg classificationConfig,
+) *LocalBehavior {
+	botHost := cfg.context.botHost
+	behaviorFlow := orientedBehaviorFlow(flow, stats, botHost)
+	packetRate := float64(stats.TotalPackets()) / durationSeconds
+
+	classification := OutboundConnection
+	if cfg.context.c2Host != 0 && packetRate > cfg.packetThreshold {
+		classification = Attack
+	}
+
+	srcToDst, dstToSrc := orientedDirectionStats(flow, stats, botHost)
+	return &LocalBehavior{
+		behaviorBase:    newBehaviorBase(classification, Local, eventTime, packetRate, cfg.packetThreshold, 0, 0, cfg.context),
+		Flow:            behaviorFlow,
+		SrcToDstPackets: srcToDst,
+		DstToSrcPackets: dstToSrc,
+		SrcToDstRate:    float64(srcToDst) / durationSeconds,
+		DstToSrcRate:    float64(dstToSrc) / durationSeconds,
+	}
+}
+
+// newGlobalBehaviorFromRates constructs a GlobalBehavior classified as Scan
+// or Idle based on whether scanRate exceeds the configured threshold.
+func newGlobalBehaviorFromRates(
+	globalPacketRate float64,
+	scanRate float64,
+	scanFlows []BehaviorFlow,
+	eventTime time.Time,
+	cfg classificationConfig,
+) *GlobalBehavior {
+	classification := Idle
+	if scanRate > cfg.destinationThreshold {
+		classification = Scan
+	}
+	return NewGlobalBehavior(
+		classification, eventTime,
+		globalPacketRate, cfg.packetThreshold,
+		scanRate, cfg.destinationThreshold,
+		scanFlows, cfg.context,
+	)
+}
+
+// assignBehaviorFlowID looks up or assigns a stable flow ID for b, persisting
+// it into current for use by subsequent behaviors in the same window.
+func assignBehaviorFlowID(b behavior, current, previous map[behaviorKey]uint64) {
+	key := b.key()
+	if id, ok := current[key]; ok {
+		b.setFlowID(id)
+		return
+	}
+	if id, ok := previous[key]; ok {
+		b.setFlowID(id)
+		current[key] = id
+		return
+	}
+	id := randomFlowID()
+	b.setFlowID(id)
+	current[key] = id
+}
+
+func hashBehaviorFlows(flows []BehaviorFlow) uint64 {
+	if len(flows) == 0 {
+		return 0
+	}
+
+	normalized := make([]BehaviorFlow, len(flows))
+	copy(normalized, flows)
+	for i := range normalized {
+		normalized[i] = normalized[i].canonical()
+		normalized[i].Protocol = strings.ToLower(strings.TrimSpace(normalized[i].Protocol))
+	}
+
+	sort.Slice(normalized, func(i, j int) bool {
+		if normalized[i].SrcHost != normalized[j].SrcHost {
+			return normalized[i].SrcHost < normalized[j].SrcHost
+		}
+		if normalized[i].SrcPort != normalized[j].SrcPort {
+			return normalized[i].SrcPort < normalized[j].SrcPort
+		}
+		if normalized[i].DstHost != normalized[j].DstHost {
+			return normalized[i].DstHost < normalized[j].DstHost
+		}
+		if normalized[i].DstPort != normalized[j].DstPort {
+			return normalized[i].DstPort < normalized[j].DstPort
+		}
+		return normalized[i].Protocol < normalized[j].Protocol
+	})
+
+	hasher := fnv.New64a()
+	for _, flow := range normalized {
+		var srcHost [4]byte
+		binary.BigEndian.PutUint32(srcHost[:], uint32(flow.SrcHost))
+		_, _ = hasher.Write(srcHost[:])
+
+		var srcPort [2]byte
+		binary.BigEndian.PutUint16(srcPort[:], flow.SrcPort)
+		_, _ = hasher.Write(srcPort[:])
+
+		var dstHost [4]byte
+		binary.BigEndian.PutUint32(dstHost[:], uint32(flow.DstHost))
+		_, _ = hasher.Write(dstHost[:])
+
+		var dstPort [2]byte
+		binary.BigEndian.PutUint16(dstPort[:], flow.DstPort)
+		_, _ = hasher.Write(dstPort[:])
+
+		_, _ = hasher.Write([]byte(flow.Protocol))
+		_, _ = hasher.Write([]byte{0})
+	}
+
+	return hasher.Sum64()
 }

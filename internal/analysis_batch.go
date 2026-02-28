@@ -20,12 +20,11 @@ const defaultMaxFlows = 1024
 
 type AnalysisConfiguration struct {
 	// configuration
-	PacketRateThreshold      float64
-	DestinationRateThreshold float64
-	WindowSize               time.Duration
-	scanDetectionMode        ScanDetectionMode
-	maxFlows                 int // maximum number of destinations to analyze per window
-	calibrate                bool
+	classificationConfig classificationConfig
+	WindowSize           time.Duration
+	scanDetectionMode    ScanDetectionMode
+	maxFlows             int // maximum number of destinations to analyze per window
+	calibrate            bool
 
 	// extra logging options
 	showIdle    bool // emit idle windows when requested
@@ -259,18 +258,20 @@ func NewAnalysisConfiguration(
 	}
 
 	return &AnalysisConfiguration{
-		logger:                   logger,
-		eventLogger:              eventLogger,
-		eventFile:                file,
-		PacketRateThreshold:      PacketThreshold,
-		DestinationRateThreshold: destinationThreshold,
-		WindowSize:               window,
-		scanDetectionMode:        scanDetectionMode,
-		calibrate:                calibrate,
-		showIdle:                 showIdle,
-		savePackets:              savePackets,
-		captureDir:               captureDir,
-		packetRings:              buffers,
+		logger:      logger,
+		eventLogger: eventLogger,
+		eventFile:   file,
+		classificationConfig: classificationConfig{
+			packetThreshold:      PacketThreshold,
+			destinationThreshold: destinationThreshold,
+		},
+		WindowSize:        window,
+		scanDetectionMode: scanDetectionMode,
+		calibrate:         calibrate,
+		showIdle:          showIdle,
+		savePackets:       savePackets,
+		captureDir:        captureDir,
+		packetRings:       buffers,
 		context: AnalysisContext{
 			botHost:            srcHost,
 			c2Host:             c2Host,
@@ -422,19 +423,10 @@ func (config *AnalysisConfiguration) flushResults() {
 	localBehaviors := make([]localBehaviorResult, 0, len(config.result.flowPacketCounts))
 	attacked := make(map[Host]bool)
 
+	cfg := config.classificationConfigFor()
+
 	for flow, stats := range config.result.flowPacketCounts {
-		totalPackets := stats.TotalPackets()
-		packetRate := float64(totalPackets) / durationSeconds
-		behaviorFlow := orientedBehaviorFlow(flow, stats, config.context.botHost)
-		localBehavior := config.classifyLocalBehavior(packetRate, behaviorFlow, config.result.windowStart)
-		if localBehavior == nil {
-			continue
-		}
-		srcToDstPackets, dstToSrcPackets := orientedDirectionStats(flow, stats, config.context.botHost)
-		localBehavior.SrcToDstPackets = srcToDstPackets
-		localBehavior.DstToSrcPackets = dstToSrcPackets
-		localBehavior.SrcToDstRate = float64(srcToDstPackets) / durationSeconds
-		localBehavior.DstToSrcRate = float64(dstToSrcPackets) / durationSeconds
+		localBehavior := newLocalBehaviorFromFlow(flow, stats, config.result.windowStart, durationSeconds, cfg)
 		localBehaviors = append(localBehaviors, localBehaviorResult{behavior: localBehavior, key: flow})
 		if localBehavior.Classification == Attack && localBehavior.Flow.DstHost != 0 {
 			attacked[localBehavior.Flow.DstHost] = true
@@ -471,17 +463,12 @@ func (config *AnalysisConfiguration) flushResults() {
 	globalPacketRate := float64(config.result.globalPacketCount) / durationSeconds
 	scanRate := computeScanRate(durationSeconds, len(scanTargets))
 
-	globalBehavior := config.classifyGlobalBehavior(
-		globalPacketRate,
-		scanRate,
-		scanTargets,
-		config.result.windowStart,
-	)
+	globalBehavior := newGlobalBehaviorFromRates(globalPacketRate, scanRate, scanTargets, config.result.windowStart, cfg)
 	currentLocalIDs := make(map[behaviorKey]uint64)
 	currentGlobalIDs := make(map[behaviorKey]uint64)
 
 	if config.shouldEmitGlobalBehavior(globalBehavior) {
-		config.assignGlobalBehaviorFlowID(globalBehavior, currentGlobalIDs)
+		assignBehaviorFlowID(globalBehavior, currentGlobalIDs, config.previousGlobalIDs)
 		config.logGlobalBehavior(globalBehavior)
 	}
 
@@ -492,7 +479,7 @@ func (config *AnalysisConfiguration) flushResults() {
 		if !config.shouldLogLocalBehavior(globalBehavior, localBehavior) {
 			continue
 		}
-		config.assignLocalBehaviorFlowID(localBehavior, currentLocalIDs)
+		assignBehaviorFlowID(localBehavior, currentLocalIDs, config.previousLocalIDs)
 		var captured []gopacket.Packet
 		captureKey := local.key
 
@@ -539,14 +526,14 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 
 	attacked := make(map[Host]bool)
 
-	if config.context.c2Host != 0 && config.PacketRateThreshold > 0 {
+	if config.context.c2Host != 0 && config.classificationConfig.packetThreshold > 0 {
 		for flow, stats := range destinations {
 			behaviorFlow := orientedBehaviorFlow(flow, stats, config.context.botHost)
 			if behaviorFlow.DstHost == 0 {
 				continue
 			}
 			packetRate := float64(stats.TotalPackets()) / durationSeconds
-			if packetRate > config.PacketRateThreshold {
+			if packetRate > config.classificationConfig.packetThreshold {
 				attacked[behaviorFlow.DstHost] = true
 			}
 		}
@@ -719,40 +706,11 @@ func (config *AnalysisConfiguration) persistPackets(behavior *LocalBehavior, pac
 	return false
 }
 
-func (config *AnalysisConfiguration) classifyLocalBehavior(
-	packetRate float64,
-	flow BehaviorFlow,
-	eventTime time.Time,
-) *LocalBehavior {
-	flowCopy := flow // avoid referencing loop variable
 
-	config.logger.Debug(
-		"Classifying local behavior",
-		"packetRate", packetRate,
-		"threshold", config.PacketRateThreshold,
-		"flow", flowCopy.String(),
-		"protocol", flowCopy.Protocol,
-	)
-
-	// attacks can only occur if a C2 IP is specified (assumed)
-	if config != nil && config.context.c2Host != 0 && packetRate > config.PacketRateThreshold {
-		return NewLocalBehavior(
-			Attack,
-			eventTime,
-			packetRate,
-			config.PacketRateThreshold,
-			flowCopy,
-			&config.context,
-		)
-	}
-	return NewLocalBehavior(
-		OutboundConnection,
-		eventTime,
-		packetRate,
-		config.PacketRateThreshold,
-		flowCopy,
-		&config.context,
-	)
+func (config *AnalysisConfiguration) classificationConfigFor() classificationConfig {
+	cfg := config.classificationConfig
+	cfg.context = &config.context
+	return cfg
 }
 
 func (config *AnalysisConfiguration) shouldLogLocalBehavior(globalBehavior *GlobalBehavior, localBehavior *LocalBehavior) bool {
@@ -779,49 +737,6 @@ func (config *AnalysisConfiguration) shouldEmitGlobalBehavior(behavior *GlobalBe
 	}
 }
 
-func (config *AnalysisConfiguration) assignLocalBehaviorFlowID(
-	behavior *LocalBehavior,
-	current map[behaviorKey]uint64,
-) {
-	if behavior == nil {
-		return
-	}
-	key := newBehaviorKeyFromLocalBehavior(behavior)
-	if id, ok := current[key]; ok {
-		behavior.assignedFlowID = id
-		return
-	}
-	if id, ok := config.previousLocalIDs[key]; ok {
-		behavior.assignedFlowID = id
-		current[key] = id
-		return
-	}
-	id := randomFlowID()
-	behavior.assignedFlowID = id
-	current[key] = id
-}
-
-func (config *AnalysisConfiguration) assignGlobalBehaviorFlowID(
-	behavior *GlobalBehavior,
-	current map[behaviorKey]uint64,
-) {
-	if behavior == nil {
-		return
-	}
-	key := newBehaviorKeyFromGlobalBehavior(behavior)
-	if id, ok := current[key]; ok {
-		behavior.assignedFlowID = id
-		return
-	}
-	if id, ok := config.previousGlobalIDs[key]; ok {
-		behavior.assignedFlowID = id
-		current[key] = id
-		return
-	}
-	id := randomFlowID()
-	behavior.assignedFlowID = id
-	current[key] = id
-}
 
 func randomFlowID() uint64 {
 	for range 16 {
@@ -837,57 +752,6 @@ func randomFlowID() uint64 {
 	panic("randomFlowID: failed to generate non-zero ID after 16 attempts")
 }
 
-func (config *AnalysisConfiguration) classifyGlobalBehavior(
-	globalPacketRate float64,
-	scanRate float64,
-	scanFlows []BehaviorFlow,
-	eventTime time.Time,
-) *GlobalBehavior {
-	if globalPacketRate > config.PacketRateThreshold {
-		config.logger.Debug(
-			"Detected global high packet rate",
-			"scope", Global,
-			"eventTime", eventTime,
-			"packetRate", globalPacketRate,
-			"threshold", config.PacketRateThreshold,
-		)
-	}
-
-	// detected a horizontal scan when the host rate exceeds the configured threshold,
-	// regardless of whether the packet-rate condition was satisfied
-	if scanRate > config.DestinationRateThreshold {
-		config.logger.Debug(
-			"Detected horizontal scan host rate",
-			"scope", Global,
-			"eventTime", eventTime,
-			"hostRate", scanRate,
-			"scanDetectionMode", config.scanDetectionMode,
-			"threshold", config.DestinationRateThreshold,
-		)
-
-		return NewGlobalBehavior(
-			Scan,
-			eventTime,
-			globalPacketRate,
-			config.PacketRateThreshold,
-			scanRate,
-			config.DestinationRateThreshold,
-			scanFlows,
-			&config.context,
-		)
-	}
-
-	return NewGlobalBehavior(
-		Idle,
-		eventTime,
-		globalPacketRate,
-		config.PacketRateThreshold,
-		scanRate,
-		config.DestinationRateThreshold,
-		scanFlows,
-		&config.context,
-	)
-}
 
 func (config *AnalysisConfiguration) Close() error {
 	if config == nil || config.eventFile == nil {
