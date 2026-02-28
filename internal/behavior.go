@@ -28,6 +28,67 @@ const (
 	Idle BehaviorClass = "idle"     // absence of activity
 )
 
+// BehaviorFlows is a slice of BehaviorFlow with set-oriented operations.
+type BehaviorFlows []BehaviorFlow
+
+// distinct returns a new slice containing only the first flow seen for each unique DstHost,
+// preserving order and skipping zero-host entries.
+func (flows BehaviorFlows) distinct() BehaviorFlows {
+	if len(flows) == 0 {
+		return nil
+	}
+	out := make(BehaviorFlows, 0, len(flows))
+	seen := make(map[Host]struct{}, len(flows))
+	for _, f := range flows {
+		if f.DstHost == 0 {
+			continue
+		}
+		if _, ok := seen[f.DstHost]; ok {
+			continue
+		}
+		seen[f.DstHost] = struct{}{}
+		out = append(out, f)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// unseen returns flows whose DstHost does not appear in previous.
+func (flows BehaviorFlows) unseen(previous map[Host]bool) BehaviorFlows {
+	if len(flows) == 0 {
+		return nil
+	}
+	if len(previous) == 0 {
+		return flows
+	}
+	var out BehaviorFlows
+	for _, f := range flows {
+		if f.DstHost != 0 && !previous[f.DstHost] {
+			out = append(out, f)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// hostSet returns a set of all non-zero DstHosts in the slice.
+func (flows BehaviorFlows) hostSet() map[Host]bool {
+	out := make(map[Host]bool, len(flows))
+	for _, f := range flows {
+		if f.DstHost != 0 {
+			out[f.DstHost] = true
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // BehaviorFlow identifies packet endpoint details used for local behavior events.
 type BehaviorFlow struct {
 	SrcPort  uint16 `json:"src_port,omitempty"`
@@ -35,22 +96,6 @@ type BehaviorFlow struct {
 	Protocol string `json:"protocol,omitempty"`
 	SrcHost  Host   `json:"src_host,omitempty"`
 	DstHost  Host   `json:"dst_host,omitempty"`
-}
-
-func ToBehaviorFlow(flow Flow, stats normalizedFlowStats, botHost Host) BehaviorFlow {
-	srcHost, dstHost := flow.Hosts()
-	srcPort, dstPort := flow.Ports()
-	if !chooseSourceEndpoint(flow, stats, botHost) {
-		srcHost, dstHost = dstHost, srcHost
-		srcPort, dstPort = dstPort, srcPort
-	}
-	return BehaviorFlow{
-		SrcHost:  srcHost,
-		SrcPort:  srcPort,
-		DstHost:  dstHost,
-		DstPort:  dstPort,
-		Protocol: flow.Protocol(),
-	}
 }
 
 // Equals returns true when two behavior flows represent the same 5-tuple

@@ -178,6 +178,24 @@ func (f Flow) canonical() (canonical Flow, srcIsA bool, valid bool) {
 	return f.Reverse(), false, true
 }
 
+// orientBy returns a BehaviorFlow oriented so that the traffic source is the
+// src endpoint, using chooseSourceEndpoint to determine direction.
+func (f Flow) orientBy(stats normalizedFlowStats, botHost Host) BehaviorFlow {
+	srcHost, dstHost := f.Hosts()
+	srcPort, dstPort := f.Ports()
+	if !chooseSourceEndpoint(f, stats, botHost) {
+		srcHost, dstHost = dstHost, srcHost
+		srcPort, dstPort = dstPort, srcPort
+	}
+	return BehaviorFlow{
+		SrcHost:  srcHost,
+		SrcPort:  srcPort,
+		DstHost:  dstHost,
+		DstPort:  dstPort,
+		Protocol: f.Protocol(),
+	}
+}
+
 type normalizedFlowStats struct {
 	PacketsAToB int
 	PacketsBToA int
@@ -189,14 +207,38 @@ func (s normalizedFlowStats) TotalPackets() int {
 
 type normalizedFlowCounts map[Flow]normalizedFlowStats
 
-func (f normalizedFlowCounts) topFlowByCount() (Flow, normalizedFlowStats) {
-	var topKey Flow
-	var topStats normalizedFlowStats
-	for key, stats := range f {
-		if stats.TotalPackets() > topStats.TotalPackets() {
-			topKey = key
-			topStats = stats
+// behaviorFlows converts each flow in the counts to an oriented BehaviorFlow,
+// dropping any with a zero destination host.
+func (fc normalizedFlowCounts) behaviorFlows(botHost Host) BehaviorFlows {
+	if len(fc) == 0 {
+		return nil
+	}
+
+	list := make(BehaviorFlows, 0, len(fc))
+	for flow, stats := range fc {
+		bf := flow.orientBy(stats, botHost)
+		if bf.DstHost == 0 {
+			continue
+		}
+		list = append(list, bf)
+	}
+	if len(list) == 0 {
+		return nil
+	}
+	return list
+}
+
+// filter returns a new normalizedFlowCounts containing only flows whose oriented
+// BehaviorFlow satisfies keep.
+func (fc normalizedFlowCounts) filter(botHost Host, keep func(BehaviorFlow) bool) normalizedFlowCounts {
+	if len(fc) == 0 {
+		return fc
+	}
+	filtered := make(normalizedFlowCounts, len(fc))
+	for flow, stats := range fc {
+		if keep(flow.orientBy(stats, botHost)) {
+			filtered[flow] = stats
 		}
 	}
-	return topKey, topStats
+	return filtered
 }

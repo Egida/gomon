@@ -737,7 +737,7 @@ func TestCountPacketsByFlowExcludesUninterestingDestinations(t *testing.T) {
 	}
 
 	for flow, stats := range counts {
-		behaviorFlow := orientedBehaviorFlow(flow, stats, 0)
+		behaviorFlow := flow.orientBy(stats, 0)
 		if behaviorFlow.DstHost == excludedHost {
 			t.Fatalf("excluded destination %s was tracked in flow counts", excludedHost.String())
 		}

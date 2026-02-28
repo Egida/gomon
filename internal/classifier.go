@@ -5,12 +5,11 @@ import (
 	"time"
 )
 
-// classificationConfig holds the thresholds and context needed to classify a
-// flow observation into a behavior.
+// classificationConfig holds the thresholds used to classify a flow observation
+// into a behavior.
 type classificationConfig struct {
 	packetThreshold      float64
 	destinationThreshold float64
-	context              *AnalysisContext
 }
 
 // assignBehaviorFlowID looks up or assigns a stable flow ID for b, persisting
@@ -95,9 +94,6 @@ func (c *BehaviorClassifier) Classify(stats WindowStats) ClassificationResult {
 	}
 	durationSeconds := windowDuration.Seconds()
 
-	cfg := c.classificationConfig
-	cfg.context = &c.context
-
 	localBehaviors := make([]localBehaviorResult, 0, len(stats.FlowCounts))
 	attacked := make(map[Host]bool)
 
@@ -111,15 +107,16 @@ func (c *BehaviorClassifier) Classify(stats WindowStats) ClassificationResult {
 
 	scanCounts := stats.FlowCounts
 	if c.scanDetectionMode == ScanDetectionFilteredHostRate {
-		scanCounts = filterNonAttackingFlows(scanCounts, attacked, c.context.botHost)
+		scanCounts = scanCounts.filter(c.context.botHost, func(bf BehaviorFlow) bool {
+			return !attacked[bf.DstHost]
+		})
 	}
-	scanDestinations := flowsFromCounts(scanCounts, c.context.botHost)
-	scanHosts := uniqueHosts(scanDestinations)
+	scanHosts := scanCounts.behaviorFlows(c.context.botHost).distinct()
 	scanTargets := scanHosts
 	if c.scanDetectionMode == ScanDetectionNewHostRate {
-		scanTargets = newHosts(scanHosts, c.previousWindowHosts)
+		scanTargets = scanHosts.unseen(c.previousWindowHosts)
 	}
-	c.previousWindowHosts = hostsFromFlows(scanHosts)
+	c.previousWindowHosts = scanHosts.hostSet()
 
 	c.logger.Debug(
 		"Classifying window",
@@ -164,8 +161,7 @@ func (c *BehaviorClassifier) classifyLocalBehavior(
 	durationSeconds float64,
 ) *LocalBehavior {
 	cfg := c.classificationConfig
-	botHost := c.classificationConfig.context.botHost
-	behaviorFlow := orientedBehaviorFlow(flow, stats, botHost)
+	botHost := c.context.botHost
 	packetRate := float64(stats.TotalPackets()) / durationSeconds
 
 	classification := OutboundConnection
@@ -173,18 +169,15 @@ func (c *BehaviorClassifier) classifyLocalBehavior(
 		classification = Attack
 	}
 
-	srcToDst, dstToSrc := orientedDirectionStats(flow, stats, botHost)
+	canonicalSrc, _ := flow.Hosts()
+	behaviorFlow := flow.orientBy(stats, botHost)
+	srcToDst, dstToSrc := stats.PacketsAToB, stats.PacketsBToA
+	if behaviorFlow.SrcHost != canonicalSrc {
+		srcToDst, dstToSrc = stats.PacketsBToA, stats.PacketsAToB
+	}
+
 	return &LocalBehavior{
-		behaviorBase: newBehaviorBase(
-			classification,
-			Local,
-			eventTime,
-			packetRate,
-			cfg.packetThreshold,
-			0,
-			0,
-			cfg.context,
-		),
+		behaviorBase:    newBehaviorBase(classification, Local, eventTime, packetRate, cfg.packetThreshold, 0, 0, &c.context),
 		Flow:            behaviorFlow,
 		SrcToDstPackets: srcToDst,
 		DstToSrcPackets: dstToSrc,
@@ -198,7 +191,7 @@ func (c *BehaviorClassifier) classifyLocalBehavior(
 func (c *BehaviorClassifier) classifyGlobalBehavior(
 	globalPacketRate float64,
 	scanRate float64,
-	scanFlows []BehaviorFlow,
+	scanFlows BehaviorFlows,
 	eventTime time.Time,
 ) *GlobalBehavior {
 	cfg := c.classificationConfig
@@ -211,6 +204,6 @@ func (c *BehaviorClassifier) classifyGlobalBehavior(
 		classification, eventTime,
 		globalPacketRate, cfg.packetThreshold,
 		scanRate, cfg.destinationThreshold,
-		scanFlows, cfg.context,
+		scanFlows, &c.context,
 	)
 }
