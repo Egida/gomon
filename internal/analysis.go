@@ -212,7 +212,7 @@ func (config *AnalysisConfiguration) flushResults() {
 func (config *AnalysisConfiguration) emit(result ClassificationResult, stats WindowStats) {
 	globalBehavior := result.GlobalBehavior
 
-	if config.shouldEmitGlobalBehavior(globalBehavior) {
+	if config.shouldLogGlobalBehavior(globalBehavior) {
 		config.logGlobalBehavior(globalBehavior)
 	}
 
@@ -350,7 +350,7 @@ func (config *AnalysisConfiguration) shouldLogLocalBehavior(globalBehavior *Glob
 	return !(globalBehavior.Classification == Scan && localBehavior.Classification == OutboundConnection)
 }
 
-func (config *AnalysisConfiguration) shouldEmitGlobalBehavior(behavior *GlobalBehavior) bool {
+func (config *AnalysisConfiguration) shouldLogGlobalBehavior(behavior *GlobalBehavior) bool {
 	if behavior == nil {
 		return false
 	}
