@@ -109,7 +109,7 @@ func ParseScanDetectionMode(value string) (ScanDetectionMode, error) {
 
 type batchResult struct {
 	windowStart       time.Time
-	flowPacketCounts  flowCounts
+	flowPacketCounts  normalizedFlowCounts
 	globalPacketCount int
 }
 
@@ -232,8 +232,8 @@ func NewAnalysisConfiguration(
 		panic("window duration must be greater than zero")
 	}
 
-	// source and C2 IPs should be excluded from analysis
-	filterIPs = append(filterIPs, srcIP, c2IP)
+	// C2 and other caller-supplied IPs should be excluded from analysis
+	filterIPs = append(filterIPs, c2IP)
 	uninterestingIPs := map[Host]bool{}
 	srcHost, _ := hostFromIPv4String(srcIP)
 	c2Host, _ := hostFromIPv4String(c2IP)
@@ -338,45 +338,45 @@ func (config *AnalysisConfiguration) captureRecentPackets(batch []gopacket.Packe
 	}
 
 	for _, packet := range batch {
-		key, ok := flowFromPacket(packet)
+		rawFlow, ok := flowFromPacket(packet)
 		if !ok {
 			continue
 		}
-		config.appendPacketForFlow(key, packet)
+		canonical, _, ok := rawFlow.canonical()
+		if !ok {
+			continue
+		}
+		config.appendPacketForFlow(canonical, packet)
 	}
 }
 
-func (config *AnalysisConfiguration) appendPacketForFlow(key Flow, packet gopacket.Packet) {
-	if !config.shouldTrackFlow(key) {
+func (config *AnalysisConfiguration) appendPacketForFlow(flow Flow, packet gopacket.Packet) {
+	if !config.shouldTrackFlow(flow) {
 		return
 	}
 
-	buf, ok := config.packetRings[key]
+	buf, ok := config.packetRings[flow]
 	if !ok {
 		buf = newPacketRing(config.savePackets)
-		config.packetRings[key] = buf
+		config.packetRings[flow] = buf
 	}
 	buf.add(packet)
 }
 
-func (config *AnalysisConfiguration) shouldTrackFlow(key Flow) bool {
+func (config *AnalysisConfiguration) shouldTrackFlow(flow Flow) bool {
 	if config.savePackets <= 0 {
 		return false
 	}
-	if src, ok := hostFromEndpoint(key.NetworkFlow.Src()); ok && config.context.uninterestingHosts[src] {
-		return true
-	}
-	if dst, ok := hostFromEndpoint(key.NetworkFlow.Dst()); ok && config.context.uninterestingHosts[dst] {
-		return true
-	}
-	return false
+	srcHost, dstHost := flow.Hosts()
+	return !config.context.uninterestingHosts[srcHost] &&
+		!config.context.uninterestingHosts[dstHost]
 }
 
-func (config *AnalysisConfiguration) snapshotFlowPackets(key Flow) []gopacket.Packet {
+func (config *AnalysisConfiguration) snapshotFlowPackets(flow Flow) []gopacket.Packet {
 	if config.packetRings == nil {
 		return nil
 	}
-	buf, ok := config.packetRings[key]
+	buf, ok := config.packetRings[flow]
 	if !ok || buf == nil {
 		return nil
 	}
@@ -384,6 +384,8 @@ func (config *AnalysisConfiguration) snapshotFlowPackets(key Flow) []gopacket.Pa
 }
 
 func (config *AnalysisConfiguration) flushResults() {
+	defer config.resetWindowState()
+
 	if config.result.globalPacketCount == 0 && len(config.result.flowPacketCounts) == 0 {
 		config.previousLocalIDs = nil
 		config.previousGlobalIDs = nil
@@ -393,7 +395,6 @@ func (config *AnalysisConfiguration) flushResults() {
 	if config.result.windowStart.IsZero() {
 		return
 	}
-	defer config.resetWindowState()
 
 	windowDuration := config.WindowSize
 	if windowDuration <= 0 {
@@ -421,14 +422,20 @@ func (config *AnalysisConfiguration) flushResults() {
 	localBehaviors := make([]localBehaviorResult, 0, len(config.result.flowPacketCounts))
 	attacked := make(map[Host]bool)
 
-	for key, count := range config.result.flowPacketCounts {
-		packetRate := float64(count) / durationSeconds
-		behaviorFlow := behaviorFlowFromFlow(key)
+	for flow, stats := range config.result.flowPacketCounts {
+		totalPackets := stats.TotalPackets()
+		packetRate := float64(totalPackets) / durationSeconds
+		behaviorFlow := orientedBehaviorFlow(flow, stats, config.context.botHost)
 		localBehavior := config.classifyLocalBehavior(packetRate, behaviorFlow, config.result.windowStart)
 		if localBehavior == nil {
 			continue
 		}
-		localBehaviors = append(localBehaviors, localBehaviorResult{behavior: localBehavior, key: key})
+		srcToDstPackets, dstToSrcPackets := orientedDirectionStats(flow, stats, config.context.botHost)
+		localBehavior.SrcToDstPackets = srcToDstPackets
+		localBehavior.DstToSrcPackets = dstToSrcPackets
+		localBehavior.SrcToDstRate = float64(srcToDstPackets) / durationSeconds
+		localBehavior.DstToSrcRate = float64(dstToSrcPackets) / durationSeconds
+		localBehaviors = append(localBehaviors, localBehaviorResult{behavior: localBehavior, key: flow})
 		if localBehavior.Classification == Attack && localBehavior.Flow.DstHost != 0 {
 			attacked[localBehavior.Flow.DstHost] = true
 		}
@@ -436,9 +443,9 @@ func (config *AnalysisConfiguration) flushResults() {
 
 	scanCounts := config.result.flowPacketCounts
 	if config.scanDetectionMode == ScanDetectionFilteredHostRate {
-		scanCounts = config.filterNonAttackingFlows(scanCounts, attacked)
+		scanCounts = filterNonAttackingFlows(scanCounts, attacked, config.context.botHost)
 	}
-	scanDestinations := flowsFromCounts(scanCounts)
+	scanDestinations := flowsFromCounts(scanCounts, config.context.botHost)
 	scanHosts := uniqueHosts(scanDestinations)
 	scanTargets := scanHosts
 	if config.scanDetectionMode == ScanDetectionNewHostRate {
@@ -533,12 +540,12 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 	attacked := make(map[Host]bool)
 
 	if config.context.c2Host != 0 && config.PacketRateThreshold > 0 {
-		for key, count := range destinations {
-			behaviorFlow := behaviorFlowFromFlow(key)
+		for flow, stats := range destinations {
+			behaviorFlow := orientedBehaviorFlow(flow, stats, config.context.botHost)
 			if behaviorFlow.DstHost == 0 {
 				continue
 			}
-			packetRate := float64(count) / durationSeconds
+			packetRate := float64(stats.TotalPackets()) / durationSeconds
 			if packetRate > config.PacketRateThreshold {
 				attacked[behaviorFlow.DstHost] = true
 			}
@@ -547,10 +554,10 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 
 	scanCounts := destinations
 	if config.scanDetectionMode == ScanDetectionFilteredHostRate {
-		scanCounts = config.filterNonAttackingFlows(scanCounts, attacked)
+		scanCounts = filterNonAttackingFlows(scanCounts, attacked, config.context.botHost)
 	}
 
-	scanHosts := uniqueHosts(flowsFromCounts(scanCounts))
+	scanHosts := uniqueHosts(flowsFromCounts(scanCounts, config.context.botHost))
 	scanTargets := scanHosts
 	if config.scanDetectionMode == ScanDetectionNewHostRate {
 		scanTargets = newHosts(scanHosts, config.previousWindowHosts)
@@ -559,18 +566,18 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 
 	scanRate := computeScanRate(durationSeconds, len(scanTargets))
 
-	topFlow, topCount := destinations.topFlowByCount()
-	topBehaviorFlow := behaviorFlowFromFlow(topFlow)
+	topFlow, topStats := destinations.topFlowByCount()
+	topBehaviorFlow := orientedBehaviorFlow(topFlow, topStats, config.context.botHost)
 	topRate := 0.0
-	if topCount > 0 {
-		topRate = float64(topCount) / durationSeconds
+	if topStats.TotalPackets() > 0 {
+		topRate = float64(topStats.TotalPackets()) / durationSeconds
 	}
 	topLabel := "<none>"
-	if topCount > 0 {
+	if topStats.TotalPackets() > 0 {
 		topLabel = topBehaviorFlow.String()
 	}
 
-	config.calibration.update(globalPacketRate, scanRate, topBehaviorFlow, topCount, topRate)
+	config.calibration.update(globalPacketRate, scanRate, topBehaviorFlow, topStats.TotalPackets(), topRate)
 
 	nullTestActivity := "idle"
 	if config.result.globalPacketCount > 0 {
@@ -594,12 +601,12 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 		"requiredPacketThreshold", topRate,
 		"requiredDestinationThreshold", scanRate,
 		"maxFlow", topLabel,
-		"maxFlowPackets", topCount,
+		"maxFlowPackets", topStats.TotalPackets(),
 		"maxFlowRate", topRate,
 		"nullTestActivity", nullTestActivity,
 	}
 
-	if topCount > 0 {
+	if topStats.TotalPackets() > 0 {
 		args = append(
 			args,
 			"maxFlowIP", topBehaviorFlow.DstHost.String(),
@@ -817,16 +824,17 @@ func (config *AnalysisConfiguration) assignGlobalBehaviorFlowID(
 }
 
 func randomFlowID() uint64 {
-	for {
+	for range 16 {
 		var b [8]byte
 		if _, err := rand.Read(b[:]); err != nil {
+			slog.Error("Failed to read random bytes for flow ID", "error", err)
 			continue
 		}
-		id := binary.BigEndian.Uint64(b[:])
-		if id != 0 {
+		if id := binary.BigEndian.Uint64(b[:]); id != 0 {
 			return id
 		}
 	}
+	panic("randomFlowID: failed to generate non-zero ID after 16 attempts")
 }
 
 func (config *AnalysisConfiguration) classifyGlobalBehavior(
@@ -879,26 +887,6 @@ func (config *AnalysisConfiguration) classifyGlobalBehavior(
 		scanFlows,
 		&config.context,
 	)
-}
-
-func (config *AnalysisConfiguration) filterNonAttackingFlows(
-	destinations flowCounts,
-	attacked map[Host]bool,
-) flowCounts {
-	if len(destinations) == 0 || len(attacked) == 0 {
-		return destinations
-	}
-
-	filtered := make(flowCounts, len(destinations))
-
-	for key, count := range destinations {
-		behaviorFlow := behaviorFlowFromFlow(key)
-		if !attacked[behaviorFlow.DstHost] {
-			filtered[key] = count
-		}
-	}
-
-	return filtered
 }
 
 func (config *AnalysisConfiguration) Close() error {

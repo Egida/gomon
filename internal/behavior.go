@@ -108,6 +108,7 @@ func hashBehaviorFlows(flows []BehaviorFlow) uint64 {
 	normalized := make([]BehaviorFlow, len(flows))
 	copy(normalized, flows)
 	for i := range normalized {
+		normalized[i] = canonicalBehaviorFlow(normalized[i])
 		normalized[i].Protocol = strings.ToLower(strings.TrimSpace(normalized[i].Protocol))
 	}
 
@@ -152,6 +153,14 @@ func hashBehaviorFlows(flows []BehaviorFlow) uint64 {
 	return hasher.Sum64()
 }
 
+func canonicalBehaviorFlow(flow BehaviorFlow) BehaviorFlow {
+	if flow.DstHost < flow.SrcHost || (flow.DstHost == flow.SrcHost && flow.DstPort < flow.SrcPort) {
+		flow.SrcHost, flow.DstHost = flow.DstHost, flow.SrcHost
+		flow.SrcPort, flow.DstPort = flow.DstPort, flow.SrcPort
+	}
+	return flow
+}
+
 type behaviorBase struct {
 	Classification BehaviorClass `json:"classification"`
 	Scope          BehaviorScope `json:"scope"`      // Indicates the scope of the behavior (global/local)
@@ -178,6 +187,11 @@ type BehaviorContext struct {
 type LocalBehavior struct {
 	behaviorBase
 	Flow BehaviorFlow `json:"flow"`
+
+	SrcToDstPackets int     `json:"-"`
+	DstToSrcPackets int     `json:"-"`
+	SrcToDstRate    float64 `json:"-"`
+	DstToSrcRate    float64 `json:"-"`
 }
 
 type GlobalBehavior struct {

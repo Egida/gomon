@@ -62,6 +62,11 @@ type EveDetails struct {
 	PacketThreshold          float64          `json:"packet_threshold,omitempty"`
 	DestinationRate          float64          `json:"destination_rate,omitempty"`
 	DestinationRateThreshold float64          `json:"destination_rate_threshold,omitempty"`
+	SrcToDstPackets          int              `json:"src_to_dst_packets,omitempty"`
+	DstToSrcPackets          int              `json:"dst_to_src_packets,omitempty"`
+	SrcToDstRate             float64          `json:"src_to_dst_rate,omitempty"`
+	DstToSrcRate             float64          `json:"dst_to_src_rate,omitempty"`
+	AmplificationFactor      float64          `json:"amplification_factor,omitempty"`
 }
 
 func NewEveLogger(w io.Writer) *EveLogger {
@@ -219,6 +224,10 @@ func eventMetadataFromLocalBehavior(behavior *LocalBehavior) map[string]any {
 		return nil
 	}
 	base := &behavior.behaviorBase
+	amplificationFactor := 0.0
+	if behavior.SrcToDstPackets > 0 {
+		amplificationFactor = float64(behavior.DstToSrcPackets) / float64(behavior.SrcToDstPackets)
+	}
 	d := &EveDetails{
 		Scope:                    base.Scope,
 		Context:                  base.Context,
@@ -226,6 +235,11 @@ func eventMetadataFromLocalBehavior(behavior *LocalBehavior) map[string]any {
 		PacketThreshold:          base.PacketThreshold,
 		DestinationRate:          base.DestinationRate,
 		DestinationRateThreshold: base.DestinationRateThreshold,
+		SrcToDstPackets:          behavior.SrcToDstPackets,
+		DstToSrcPackets:          behavior.DstToSrcPackets,
+		SrcToDstRate:             behavior.SrcToDstRate,
+		DstToSrcRate:             behavior.DstToSrcRate,
+		AmplificationFactor:      amplificationFactor,
 	}
 	return map[string]any{"gomon": d}
 }

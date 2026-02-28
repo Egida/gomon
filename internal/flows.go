@@ -106,19 +106,97 @@ func flowFromPacket(packet gopacket.Packet) (Flow, bool) {
 	return key, true
 }
 
-type flowCounts map[Flow]int
+func portFromEndpoint(endpoint gopacket.Endpoint) (uint16, bool) {
+	raw := endpoint.Raw()
+	if len(raw) != 2 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint16(raw), true
+}
 
-// Retrieves the flow with the most counts. This function is nondeterministic in
-// case of ties.
-func (f flowCounts) topFlowByCount() (Flow, int) {
-	topFlow := Flow{}
-	topCount := 0
+// Reverse returns a new Flow with both network and transport directions swapped.
+func (f Flow) Reverse() Flow {
+	return Flow{
+		NetworkFlow:   f.NetworkFlow.Reverse(),
+		TransportFlow: f.TransportFlow.Reverse(),
+	}
+}
 
-	for flow, count := range f {
-		if topCount < max(topCount, count) {
-			topCount = count
-			topFlow = flow
+// Hosts returns the source and destination IPv4 host addresses of the flow.
+func (f Flow) Hosts() (src Host, dst Host) {
+	src, _ = hostFromEndpoint(f.NetworkFlow.Src())
+	dst, _ = hostFromEndpoint(f.NetworkFlow.Dst())
+	return
+}
+
+// Ports returns the source and destination ports of the flow's transport layer.
+func (f Flow) Ports() (src uint16, dst uint16) {
+	src, _ = portFromEndpoint(f.TransportFlow.Src())
+	dst, _ = portFromEndpoint(f.TransportFlow.Dst())
+	return
+}
+
+// Protocol returns the transport protocol of the flow as a lowercase string.
+func (f Flow) Protocol() string {
+	transportType := strings.ToLower(f.TransportFlow.EndpointType().String())
+	switch {
+	case strings.Contains(transportType, "tcp"):
+		return "tcp"
+	case strings.Contains(transportType, "udp"):
+		return "udp"
+	case strings.Contains(transportType, "sctp"):
+		return "sctp"
+	}
+	networkType := strings.ToLower(f.NetworkFlow.EndpointType().String())
+	if networkType != "" && networkType != "invalidendpoint" {
+		return networkType
+	}
+	return ""
+}
+
+// canonical returns the flow in canonical form (src ≤ dst by host then port),
+// whether the original source direction is preserved (srcIsA=true), and
+// whether the flow is valid (both hosts are non-zero).
+func (f Flow) canonical() (canonical Flow, srcIsA bool, valid bool) {
+	srcHost, _ := hostFromEndpoint(f.NetworkFlow.Src())
+	dstHost, _ := hostFromEndpoint(f.NetworkFlow.Dst())
+	if srcHost == 0 || dstHost == 0 {
+		return Flow{}, false, false
+	}
+	if srcHost < dstHost {
+		return f, true, true
+	}
+	if srcHost > dstHost {
+		return f.Reverse(), false, true
+	}
+	// Same host: break the tie on port.
+	srcPort, _ := portFromEndpoint(f.TransportFlow.Src())
+	dstPort, _ := portFromEndpoint(f.TransportFlow.Dst())
+	if srcPort <= dstPort {
+		return f, true, true
+	}
+	return f.Reverse(), false, true
+}
+
+type normalizedFlowStats struct {
+	PacketsAToB int
+	PacketsBToA int
+}
+
+func (s normalizedFlowStats) TotalPackets() int {
+	return s.PacketsAToB + s.PacketsBToA
+}
+
+type normalizedFlowCounts map[Flow]normalizedFlowStats
+
+func (f normalizedFlowCounts) topFlowByCount() (Flow, normalizedFlowStats) {
+	var topKey Flow
+	var topStats normalizedFlowStats
+	for key, stats := range f {
+		if stats.TotalPackets() > topStats.TotalPackets() {
+			topKey = key
+			topStats = stats
 		}
 	}
-	return topFlow, topCount
+	return topKey, topStats
 }

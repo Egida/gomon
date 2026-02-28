@@ -67,7 +67,7 @@ func TestEveAttackFormatting(t *testing.T) {
 	}
 }
 
-func TestAttackWithSpoofedSourceIP(t *testing.T) {
+func TestAttackWithSpoofedSourceIPUsesLeastSenderOrientation(t *testing.T) {
 	buf := &bytes.Buffer{}
 	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 1, 10)
 
@@ -87,11 +87,12 @@ func TestAttackWithSpoofedSourceIP(t *testing.T) {
 		t.Fatalf("expected attack alert, got %v", events)
 	}
 
-	if attack.SrcIP != spoofedSrc {
-		t.Fatalf("expected spoofed SrcIP %s, got %s", spoofedSrc, attack.SrcIP)
+	// No bot/local endpoint is present in flow; least-sender rule picks victim as source.
+	if attack.SrcIP != "198.51.100.10" {
+		t.Fatalf("expected oriented SrcIP 198.51.100.10, got %s", attack.SrcIP)
 	}
-	if attack.SrcIP == "10.0.0.5" {
-		t.Fatalf("expected attack SrcIP to differ from context source 10.0.0.5, got %s", attack.SrcIP)
+	if attack.DestIP != spoofedSrc {
+		t.Fatalf("expected oriented DestIP %s, got %s", spoofedSrc, attack.DestIP)
 	}
 	if attack.Gomon == nil || attack.Gomon.Context == nil {
 		t.Fatalf("expected gomon.context.bot_ip to be present, got %#v", attack.Gomon)
@@ -414,6 +415,141 @@ func TestLocalFlowIDReusedAcrossConsecutiveWindows(t *testing.T) {
 	}
 }
 
+func TestBidirectionalFlowEmitsSingleLocalAlert(t *testing.T) {
+	buf := &bytes.Buffer{}
+	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 1, 100)
+	now := time.Now()
+
+	packets := []gopacket.Packet{
+		buildTestPacketWithTuple(t, layers.IPProtocolUDP, "198.51.100.10", 1111, "198.51.100.20", 2222),
+		buildTestPacketWithTuple(t, layers.IPProtocolUDP, "198.51.100.10", 1111, "198.51.100.20", 2222),
+		buildTestPacketWithTuple(t, layers.IPProtocolUDP, "198.51.100.20", 2222, "198.51.100.10", 1111),
+	}
+
+	config.ProcessBatch(nil, packets, now)
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+	attacks := findEventsByCategory(events, "attack")
+	if len(attacks) != 1 {
+		t.Fatalf("expected one local alert for bidirectional pair, got %d (%v)", len(attacks), events)
+	}
+}
+
+func TestBidirectionalStatsInMetadata(t *testing.T) {
+	buf := &bytes.Buffer{}
+	config := newTestAnalysisConfigWithC2(buf, "", 100, 100)
+	now := time.Now()
+
+	// 10 sends 1 query; 20 sends 2 responses (amplification factor = 2).
+	packets := []gopacket.Packet{
+		buildTestPacketWithTuple(t, layers.IPProtocolUDP, "198.51.100.10", 1111, "198.51.100.20", 2222),
+		buildTestPacketWithTuple(t, layers.IPProtocolUDP, "198.51.100.20", 2222, "198.51.100.10", 1111),
+		buildTestPacketWithTuple(t, layers.IPProtocolUDP, "198.51.100.20", 2222, "198.51.100.10", 1111),
+	}
+
+	config.ProcessBatch(nil, packets, now)
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+	conn := findEventByCategory(events, "connection")
+	if conn == nil || conn.Gomon == nil {
+		t.Fatalf("expected outbound connection with gomon metadata, got %v", events)
+	}
+	if conn.Gomon.SrcToDstPackets != 1 || conn.Gomon.DstToSrcPackets != 2 {
+		t.Fatalf(
+			"expected oriented stats src_to_dst=1,dst_to_src=2 got src_to_dst=%d dst_to_src=%d",
+			conn.Gomon.SrcToDstPackets,
+			conn.Gomon.DstToSrcPackets,
+		)
+	}
+	if conn.Gomon.AmplificationFactor != 2.0 {
+		t.Fatalf("expected amplification_factor 2.0, got %v", conn.Gomon.AmplificationFactor)
+	}
+	if conn.Gomon.SrcToDstRate <= 0 || conn.Gomon.DstToSrcRate <= 0 {
+		t.Fatalf("expected non-zero bidirectional rates, got %#v", conn.Gomon)
+	}
+}
+
+func TestSourceSelectionPriorityBotThenLocalThenLeast(t *testing.T) {
+	t.Run("bot preferred", func(t *testing.T) {
+		buf := &bytes.Buffer{}
+		config := newTestAnalysisConfigWithC2(buf, "", 100, 100)
+		now := time.Now()
+		packets := []gopacket.Packet{
+			buildTestPacketWithTuple(t, layers.IPProtocolTCP, "10.0.0.5", 1111, "198.51.100.20", 2222),
+			buildTestPacketWithTuple(t, layers.IPProtocolTCP, "198.51.100.20", 2222, "10.0.0.5", 1111),
+		}
+		config.ProcessBatch(nil, packets, now)
+		config.flushResults()
+		events := parseEveEvents(t, buf.Bytes())
+		conn := findEventByCategory(events, "connection")
+		if conn == nil {
+			t.Fatalf("expected connection event, got %v", events)
+		}
+		if conn.SrcIP != "10.0.0.5" {
+			t.Fatalf("expected bot as source, got %s", conn.SrcIP)
+		}
+	})
+
+	t.Run("local preferred", func(t *testing.T) {
+		buf := &bytes.Buffer{}
+		config := newTestAnalysisConfigWithC2(buf, "", 100, 100)
+		now := time.Now()
+		packets := []gopacket.Packet{
+			buildTestPacketWithTuple(t, layers.IPProtocolTCP, "192.168.1.10", 1111, "198.51.100.20", 2222),
+			buildTestPacketWithTuple(t, layers.IPProtocolTCP, "198.51.100.20", 2222, "192.168.1.10", 1111),
+		}
+		config.ProcessBatch(nil, packets, now)
+		config.flushResults()
+		events := parseEveEvents(t, buf.Bytes())
+		conn := findEventByCategory(events, "connection")
+		if conn == nil {
+			t.Fatalf("expected connection event, got %v", events)
+		}
+		if conn.SrcIP != "192.168.1.10" {
+			t.Fatalf("expected RFC1918 endpoint as source, got %s", conn.SrcIP)
+		}
+	})
+
+	t.Run("least sender then lexical tie", func(t *testing.T) {
+		buf := &bytes.Buffer{}
+		config := newTestAnalysisConfigWithC2(buf, "", 100, 100)
+		now := time.Now()
+		packets := []gopacket.Packet{
+			buildTestPacketWithTuple(t, layers.IPProtocolTCP, "198.51.100.30", 1111, "203.0.113.40", 2222),
+			buildTestPacketWithTuple(t, layers.IPProtocolTCP, "198.51.100.30", 1111, "203.0.113.40", 2222),
+			buildTestPacketWithTuple(t, layers.IPProtocolTCP, "203.0.113.40", 2222, "198.51.100.30", 1111),
+		}
+		config.ProcessBatch(nil, packets, now)
+		config.flushResults()
+		events := parseEveEvents(t, buf.Bytes())
+		conn := findEventByCategory(events, "connection")
+		if conn == nil {
+			t.Fatalf("expected connection event, got %v", events)
+		}
+		if conn.SrcIP != "203.0.113.40" {
+			t.Fatalf("expected least-sender endpoint as source, got %s", conn.SrcIP)
+		}
+
+		buf.Reset()
+		packets = []gopacket.Packet{
+			buildTestPacketWithTuple(t, layers.IPProtocolTCP, "198.51.100.30", 1111, "203.0.113.40", 2222),
+			buildTestPacketWithTuple(t, layers.IPProtocolTCP, "203.0.113.40", 2222, "198.51.100.30", 1111),
+		}
+		config.ProcessBatch(nil, packets, now.Add(time.Second))
+		config.flushResults()
+		events = parseEveEvents(t, buf.Bytes())
+		conn = findEventByCategory(events, "connection")
+		if conn == nil {
+			t.Fatalf("expected connection event on tie, got %v", events)
+		}
+		if conn.SrcIP != "198.51.100.30" {
+			t.Fatalf("expected lexical source on tie, got %s", conn.SrcIP)
+		}
+	})
+}
+
 func TestLocalFlowIDChangesWhenClassificationChanges(t *testing.T) {
 	buf := &bytes.Buffer{}
 	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 2, 100)
@@ -600,8 +736,8 @@ func TestCountPacketsByFlowExcludesUninterestingDestinations(t *testing.T) {
 		t.Fatalf("expected one tracked flow, got %d", len(counts))
 	}
 
-	for flow := range counts {
-		behaviorFlow := behaviorFlowFromFlow(flow)
+	for flow, stats := range counts {
+		behaviorFlow := orientedBehaviorFlow(flow, stats, 0)
 		if behaviorFlow.DstHost == excludedHost {
 			t.Fatalf("excluded destination %s was tracked in flow counts", excludedHost.String())
 		}
@@ -702,6 +838,17 @@ func buildTestPacketWithSrc(
 	dstIP string,
 	dstPort uint16,
 ) gopacket.Packet {
+	return buildTestPacketWithTuple(t, proto, srcIP, 40000, dstIP, dstPort)
+}
+
+func buildTestPacketWithTuple(
+	t *testing.T,
+	proto layers.IPProtocol,
+	srcIP string,
+	srcPort uint16,
+	dstIP string,
+	dstPort uint16,
+) gopacket.Packet {
 	t.Helper()
 
 	src := net.ParseIP(srcIP)
@@ -738,7 +885,7 @@ func buildTestPacketWithSrc(
 	switch proto {
 	case layers.IPProtocolTCP:
 		tcp := &layers.TCP{
-			SrcPort: 40000,
+			SrcPort: layers.TCPPort(srcPort),
 			DstPort: layers.TCPPort(dstPort),
 			SYN:     true,
 			Window:  14600,
@@ -747,7 +894,7 @@ func buildTestPacketWithSrc(
 		transport = tcp
 	case layers.IPProtocolUDP:
 		udp := &layers.UDP{
-			SrcPort: layers.UDPPort(40000),
+			SrcPort: layers.UDPPort(srcPort),
 			DstPort: layers.UDPPort(dstPort),
 		}
 		udp.SetNetworkLayerForChecksum(&ip)

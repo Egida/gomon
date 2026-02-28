@@ -1,9 +1,6 @@
 package internal
 
 import (
-	"encoding/binary"
-	"strings"
-
 	"github.com/google/gopacket"
 )
 
@@ -43,140 +40,197 @@ func (r *packetRing) snapshot() []gopacket.Packet {
 	return out
 }
 
-func mergeFlowCounts(acc flowCounts, batch flowCounts) flowCounts {
+func mergeFlowCounts(acc normalizedFlowCounts, batch normalizedFlowCounts) normalizedFlowCounts {
 	if len(batch) == 0 {
 		return acc
 	}
 
 	if acc == nil {
-		acc = make(flowCounts, len(batch))
+		acc = make(normalizedFlowCounts, len(batch))
 	}
 
-	for key, count := range batch {
-		if count == 0 {
+	for key, stats := range batch {
+		if stats.TotalPackets() == 0 {
 			continue
 		}
-		acc[key] += count
+		current := acc[key]
+		current.PacketsAToB += stats.PacketsAToB
+		current.PacketsBToA += stats.PacketsBToA
+		acc[key] = current
 	}
 
 	return acc
 }
 
-// countPacketsByFlow tallies packets overall and per flow.
+// countPacketsByFlow tallies packets overall and per normalized bidirectional flow.
+// Flows where either endpoint is in exclude are skipped entirely.
 func countPacketsByFlow(
 	packets *[]gopacket.Packet,
 	exclude map[Host]bool,
 	maxFlows int,
-) (int, flowCounts, error) {
+) (int, normalizedFlowCounts, error) {
 	if packets == nil || len(*packets) == 0 {
 		return 0, nil, nil
 	}
 
-	hostCounts := make(flowCounts, maxFlows)
+	hostCounts := make(normalizedFlowCounts, maxFlows)
 	total := 0
 
 	for _, packet := range *packets {
 		if packet == nil {
 			continue
 		}
-		key, ok := flowFromPacket(packet)
+		rawFlow, ok := flowFromPacket(packet)
 		if !ok {
 			continue
 		}
-
-		behaviorFlow := behaviorFlowFromFlow(key)
-		if behaviorFlow.DstHost == 0 {
+		normFlow, srcIsA, ok := rawFlow.canonical()
+		if !ok {
 			continue
 		}
-
-		if exclude[behaviorFlow.DstHost] {
+		srcHost, dstHost := normFlow.Hosts()
+		if len(exclude) > 0 && (exclude[srcHost] || exclude[dstHost]) {
 			continue
 		}
-
-		total++
-
-		if _, exists := hostCounts[key]; exists {
-			hostCounts[key]++
-			continue
-		}
-
-		if len(hostCounts) >= maxFlows {
+		stats, exists := hostCounts[normFlow]
+		if !exists && len(hostCounts) >= maxFlows {
 			return total, hostCounts, &MaxFlowsReached{}
 		}
+		if srcIsA {
+			stats.PacketsAToB++
+		} else {
+			stats.PacketsBToA++
+		}
+		total++
+		hostCounts[normFlow] = stats
+	}
 
-		hostCounts[key] = 1
+	if len(hostCounts) == 0 {
+		return 0, nil, nil
 	}
 
 	return total, hostCounts, nil
 }
 
-func behaviorFlowFromFlow(flow Flow) BehaviorFlow {
-	var out BehaviorFlow
-
-	src := flow.NetworkFlow.Src()
-	dst := flow.NetworkFlow.Dst()
-
-	if srcHost, ok := hostFromEndpoint(src); ok {
-		out.SrcHost = srcHost
+func isRFC1918(host Host) bool {
+	ip := uint32(host)
+	// 10.0.0.0/8
+	if ip&0xff000000 == 0x0a000000 {
+		return true
 	}
-	if dstHost, ok := hostFromEndpoint(dst); ok {
-		out.DstHost = dstHost
+	// 172.16.0.0/12
+	if ip&0xfff00000 == 0xac100000 {
+		return true
 	}
-
-	if srcPort, ok := portFromEndpoint(flow.TransportFlow.Src()); ok {
-		out.SrcPort = srcPort
-	}
-	if dstPort, ok := portFromEndpoint(flow.TransportFlow.Dst()); ok {
-		out.DstPort = dstPort
-	}
-
-	out.Protocol = protocolFromFlow(flow)
-	return out
+	// 192.168.0.0/16
+	return ip&0xffff0000 == 0xc0a80000
 }
 
-func portFromEndpoint(endpoint gopacket.Endpoint) (uint16, bool) {
-	raw := endpoint.Raw()
-	if len(raw) != 2 {
-		return 0, false
+// chooseSourceEndpoint returns true if the canonical A side (src) of the flow
+// should be treated as the traffic source. The flow must be in canonical form
+// (src ≤ dst), so the final tie-break always picks A.
+func chooseSourceEndpoint(flow Flow, stats normalizedFlowStats, botHost Host) bool {
+	srcHost, dstHost := flow.Hosts()
+
+	aIsBot := botHost != 0 && srcHost == botHost
+	bIsBot := botHost != 0 && dstHost == botHost
+	if aIsBot && !bIsBot {
+		return true
 	}
-	return binary.BigEndian.Uint16(raw), true
+	if bIsBot && !aIsBot {
+		return false
+	}
+	if aIsBot && bIsBot {
+		return true // canonical: src ≤ dst
+	}
+
+	aIsLocal := isRFC1918(srcHost)
+	bIsLocal := isRFC1918(dstHost)
+	if aIsLocal && !bIsLocal {
+		return true
+	}
+	if bIsLocal && !aIsLocal {
+		return false
+	}
+	if aIsLocal && bIsLocal {
+		return true // canonical: src ≤ dst
+	}
+
+	if stats.PacketsAToB < stats.PacketsBToA {
+		return true
+	}
+	if stats.PacketsBToA < stats.PacketsAToB {
+		return false
+	}
+
+	return true // canonical: src ≤ dst
 }
 
-func protocolFromFlow(flow Flow) string {
-	transportType := strings.ToLower(flow.TransportFlow.EndpointType().String())
-	switch {
-	case strings.Contains(transportType, "tcp"):
-		return "tcp"
-	case strings.Contains(transportType, "udp"):
-		return "udp"
-	case strings.Contains(transportType, "sctp"):
-		return "sctp"
+func orientedBehaviorFlow(flow Flow, stats normalizedFlowStats, botHost Host) BehaviorFlow {
+	srcHost, dstHost := flow.Hosts()
+	srcPort, dstPort := flow.Ports()
+	if !chooseSourceEndpoint(flow, stats, botHost) {
+		srcHost, dstHost = dstHost, srcHost
+		srcPort, dstPort = dstPort, srcPort
 	}
-
-	networkType := strings.ToLower(flow.NetworkFlow.EndpointType().String())
-	if networkType != "" && networkType != "invalidendpoint" {
-		return networkType
+	return BehaviorFlow{
+		SrcHost:  srcHost,
+		SrcPort:  srcPort,
+		DstHost:  dstHost,
+		DstPort:  dstPort,
+		Protocol: flow.Protocol(),
 	}
-	return ""
 }
 
-func flowsFromCounts(flows flowCounts) []BehaviorFlow {
+func orientedDirectionStats(
+	flow Flow,
+	stats normalizedFlowStats,
+	botHost Host,
+) (srcToDstPackets int, dstToSrcPackets int) {
+	if chooseSourceEndpoint(flow, stats, botHost) {
+		return stats.PacketsAToB, stats.PacketsBToA
+	}
+	return stats.PacketsBToA, stats.PacketsAToB
+}
+
+func flowsFromCounts(flows normalizedFlowCounts, botHost Host) []BehaviorFlow {
 	if len(flows) == 0 {
 		return nil
 	}
 
 	list := make([]BehaviorFlow, 0, len(flows))
-
-	for flow := range flows {
-		behaviorFlow := behaviorFlowFromFlow(flow)
+	for flow, stats := range flows {
+		behaviorFlow := orientedBehaviorFlow(flow, stats, botHost)
 		if behaviorFlow.DstHost == 0 {
 			continue
 		}
 		list = append(list, behaviorFlow)
 	}
-
+	if len(list) == 0 {
+		return nil
+	}
 	return list
 }
+
+func filterNonAttackingFlows(
+	destinations normalizedFlowCounts,
+	attacked map[Host]bool,
+	botHost Host,
+) normalizedFlowCounts {
+	if len(destinations) == 0 || len(attacked) == 0 {
+		return destinations
+	}
+
+	filtered := make(normalizedFlowCounts, len(destinations))
+	for flow, stats := range destinations {
+		behaviorFlow := orientedBehaviorFlow(flow, stats, botHost)
+		if !attacked[behaviorFlow.DstHost] {
+			filtered[flow] = stats
+		}
+	}
+	return filtered
+}
+
 
 func uniqueHosts(flows []BehaviorFlow) []BehaviorFlow {
 	if len(flows) == 0 {
