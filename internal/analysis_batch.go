@@ -387,7 +387,7 @@ func (config *AnalysisConfiguration) flushResults() {
 	}
 
 	// then log local behavior
-	capturedFlows := make(map[Flow]struct{})
+	capturedFlows := make(map[Flow]bool)
 	for _, local := range localBehaviors {
 		localBehavior := local.behavior
 		if !config.shouldLogLocalBehavior(globalBehavior, localBehavior) {
@@ -400,10 +400,10 @@ func (config *AnalysisConfiguration) flushResults() {
 		if capture, err := config.captureBehavior(config, localBehavior); err != nil {
 			config.logger.Error("Failed to capture packets", "error", err)
 		} else if capture {
-			if _, seen := capturedFlows[captureKey]; seen {
+			if capturedFlows[captureKey] {
 				config.logger.Debug("Skipping duplicate capture for flow")
 			} else {
-				capturedFlows[captureKey] = struct{}{}
+				capturedFlows[captureKey] = true
 				captured = config.snapshotFlowPackets(captureKey)
 			}
 		}
