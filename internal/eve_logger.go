@@ -170,11 +170,11 @@ func baseToEvent(base *behaviorBase) *EveEvent {
 		ts = time.Now()
 	}
 	event.Timestamp = ts.UTC().Format(eveTimestampFormat)
-	if base.context != nil && base.context.botHost != 0 {
-		event.SrcIP = base.context.botHost.String()
+	if base.Context != nil && base.Context.BotHost != 0 {
+		event.SrcIP = base.Context.BotHost.String()
 	}
-	if base.context != nil && base.context.sampleID != "" {
-		event.Host = base.context.sampleID
+	if base.Context != nil && base.Context.SampleID != "" {
+		event.Host = base.Context.SampleID
 	}
 	return event
 }
@@ -353,8 +353,8 @@ func flowIDFromGlobalBehavior(behavior *GlobalBehavior) uint64 {
 	base := &behavior.behaviorBase
 	add(string(base.Classification))
 	add(string(base.Scope))
-	if base.context != nil && base.context.botHost != 0 {
-		add(base.context.botHost.String())
+	if base.Context != nil && base.Context.BotHost != 0 {
+		add(base.Context.BotHost.String())
 	}
 	for _, flow := range behavior.Flows {
 		if flow.DstHost != 0 {

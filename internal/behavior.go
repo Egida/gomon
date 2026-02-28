@@ -37,6 +37,22 @@ type BehaviorFlow struct {
 	DstHost  Host   `json:"dst_host,omitempty"`
 }
 
+func ToBehaviorFlow(flow Flow, stats normalizedFlowStats, botHost Host) BehaviorFlow {
+	srcHost, dstHost := flow.Hosts()
+	srcPort, dstPort := flow.Ports()
+	if !chooseSourceEndpoint(flow, stats, botHost) {
+		srcHost, dstHost = dstHost, srcHost
+		srcPort, dstPort = dstPort, srcPort
+	}
+	return BehaviorFlow{
+		SrcHost:  srcHost,
+		SrcPort:  srcPort,
+		DstHost:  dstHost,
+		DstPort:  dstPort,
+		Protocol: flow.Protocol(),
+	}
+}
+
 // Equals returns true when two behavior flows represent the same 5-tuple
 // (source host/port, destination host/port, protocol).
 func (f BehaviorFlow) Equals(other BehaviorFlow) bool {
@@ -93,7 +109,6 @@ type behaviorBase struct {
 	DestinationRateThreshold float64 `json:"destination_rate_threshold"`
 
 	Context *BehaviorContext `json:"context,omitempty"`
-	context *AnalysisContext `json:"-"`
 
 	// assignedFlowID is set by the classifier to preserve continuity across adjacent windows.
 	assignedFlowID uint64 `json:"-"`
@@ -101,8 +116,8 @@ type behaviorBase struct {
 
 type BehaviorContext struct {
 	SampleID string `json:"sample_id,omitempty"`
-	BotIP    Host   `json:"bot_ip,omitempty"`
-	C2IP     Host   `json:"c2_ip,omitempty"`
+	BotHost  Host   `json:"bot_ip,omitempty"`
+	C2Host   Host   `json:"c2_ip,omitempty"`
 }
 
 type LocalBehavior struct {
@@ -142,14 +157,13 @@ func newBehaviorBase(
 		PacketThreshold:          packetThreshold,
 		DestinationRate:          destinationRate,
 		DestinationRateThreshold: destinationRateThreshold,
-		context:                  context,
 	}
 
 	if context != nil {
 		ctx := &BehaviorContext{
 			SampleID: context.sampleID,
-			BotIP:    context.botHost,
-			C2IP:     context.c2Host,
+			BotHost:  context.botHost,
+			C2Host:   context.c2Host,
 		}
 		base.Context = ctx
 	}

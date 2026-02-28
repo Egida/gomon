@@ -49,8 +49,8 @@ func BuildCapturePath(baseDir string, behavior *LocalBehavior) (string, error) {
 	}
 
 	sampleComponent := ""
-	if behavior.context != nil {
-		sampleComponent = sanitizeFileComponent(behavior.context.sampleID)
+	if behavior.Context != nil {
+		sampleComponent = sanitizeFileComponent(behavior.Context.SampleID)
 	}
 	timeComponent := ts.UTC().Format("20060102T150405Z")
 
