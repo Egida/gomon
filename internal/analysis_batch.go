@@ -24,7 +24,6 @@ type AnalysisConfiguration struct {
 	WindowSize           time.Duration
 	scanDetectionMode    ScanDetectionMode
 	maxFlows             int // maximum number of destinations to analyze per window
-	calibrate            bool
 
 	// extra logging options
 	showIdle    bool // emit idle windows when requested
@@ -47,8 +46,6 @@ type AnalysisConfiguration struct {
 
 	// static context for logging
 	context AnalysisContext
-
-	calibration calibrationStats
 }
 
 type AnalysisSummary struct {
@@ -120,79 +117,6 @@ type AnalysisContext struct {
 	uninterestingHosts map[Host]bool // List of IP addresses that are not interesting for analysis
 }
 
-type calibrationStats struct {
-	windows          int
-	packetRateSum    float64
-	packetRateMax    float64
-	hostRateSum      float64
-	hostRateMax      float64
-	topFlowRateMax   float64
-	topFlowCountMax  int
-	topFlowCandidate BehaviorFlow
-}
-
-func (s *calibrationStats) update(
-	packetRate float64,
-	hostRate float64,
-	topFlow BehaviorFlow,
-	topCount int,
-	topRate float64,
-) {
-	if s == nil {
-		return
-	}
-	s.windows++
-	s.packetRateSum += packetRate
-	if packetRate > s.packetRateMax {
-		s.packetRateMax = packetRate
-	}
-	s.hostRateSum += hostRate
-	if hostRate > s.hostRateMax {
-		s.hostRateMax = hostRate
-	}
-	if topRate > s.topFlowRateMax {
-		s.topFlowRateMax = topRate
-		s.topFlowCountMax = topCount
-		s.topFlowCandidate = topFlow
-		return
-	}
-	if topRate == s.topFlowRateMax && topRate > 0 {
-		currentLabel := s.topFlowCandidate.String()
-		candidateLabel := topFlow.String()
-		if currentLabel == "" || candidateLabel < currentLabel {
-			s.topFlowCountMax = topCount
-			s.topFlowCandidate = topFlow
-		}
-	}
-}
-
-func (s *calibrationStats) packetRateAvg() float64 {
-	if s == nil || s.windows == 0 {
-		return 0
-	}
-	return s.packetRateSum / float64(s.windows)
-}
-
-func (s *calibrationStats) hostRateAvg() float64 {
-	if s == nil || s.windows == 0 {
-		return 0
-	}
-	return s.hostRateSum / float64(s.windows)
-}
-
-type CalibrationSummary struct {
-	Windows                         int
-	PacketRateAvg                   float64
-	PacketRateMax                   float64
-	HostRateAvg                     float64
-	HostRateMax                     float64
-	RecommendedPacketThreshold      float64
-	RecommendedDestinationThreshold float64
-	MaxFlow                         BehaviorFlow
-	MaxFlowRate                     float64
-	MaxFlowPackets                  int
-}
-
 func NewAnalysisConfiguration(
 	srcIP string,
 	c2IP string,
@@ -205,7 +129,6 @@ func NewAnalysisConfiguration(
 	scanDetectionMode ScanDetectionMode,
 	level slog.Level,
 	sampleID string,
-	calibrate bool,
 	savePackets int,
 	captureDir string,
 	captureBehavior func(*AnalysisConfiguration, *LocalBehavior) (bool, error),
@@ -267,7 +190,6 @@ func NewAnalysisConfiguration(
 		},
 		WindowSize:        window,
 		scanDetectionMode: scanDetectionMode,
-		calibrate:         calibrate,
 		showIdle:          showIdle,
 		savePackets:       savePackets,
 		captureDir:        captureDir,
@@ -408,14 +330,6 @@ func (config *AnalysisConfiguration) flushResults() {
 	durationSeconds := windowDuration.Seconds()
 	windowEnd := config.result.windowStart.Add(windowDuration)
 
-	if config.calibrate {
-		config.previousLocalIDs = nil
-		config.previousGlobalIDs = nil
-		config.previousWindowHosts = nil
-		config.logCalibration(windowEnd, durationSeconds)
-		return
-	}
-
 	type localBehaviorResult struct {
 		behavior *LocalBehavior
 		key      Flow
@@ -511,98 +425,6 @@ func (config *AnalysisConfiguration) resetWindowState() {
 		return
 	}
 	clear(config.packetRings)
-}
-
-func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, durationSeconds float64) {
-	if config == nil {
-		return
-	}
-	if durationSeconds <= 0 {
-		durationSeconds = 1
-	}
-
-	globalPacketRate := float64(config.result.globalPacketCount) / durationSeconds
-	destinations := config.result.flowPacketCounts
-
-	attacked := make(map[Host]bool)
-
-	if config.context.c2Host != 0 && config.classificationConfig.packetThreshold > 0 {
-		for flow, stats := range destinations {
-			behaviorFlow := orientedBehaviorFlow(flow, stats, config.context.botHost)
-			if behaviorFlow.DstHost == 0 {
-				continue
-			}
-			packetRate := float64(stats.TotalPackets()) / durationSeconds
-			if packetRate > config.classificationConfig.packetThreshold {
-				attacked[behaviorFlow.DstHost] = true
-			}
-		}
-	}
-
-	scanCounts := destinations
-	if config.scanDetectionMode == ScanDetectionFilteredHostRate {
-		scanCounts = filterNonAttackingFlows(scanCounts, attacked, config.context.botHost)
-	}
-
-	scanHosts := uniqueHosts(flowsFromCounts(scanCounts, config.context.botHost))
-	scanTargets := scanHosts
-	if config.scanDetectionMode == ScanDetectionNewHostRate {
-		scanTargets = newHosts(scanHosts, config.previousWindowHosts)
-	}
-	config.previousWindowHosts = hostsFromFlows(scanHosts)
-
-	scanRate := computeScanRate(durationSeconds, len(scanTargets))
-
-	topFlow, topStats := destinations.topFlowByCount()
-	topBehaviorFlow := orientedBehaviorFlow(topFlow, topStats, config.context.botHost)
-	topRate := 0.0
-	if topStats.TotalPackets() > 0 {
-		topRate = float64(topStats.TotalPackets()) / durationSeconds
-	}
-	topLabel := "<none>"
-	if topStats.TotalPackets() > 0 {
-		topLabel = topBehaviorFlow.String()
-	}
-
-	config.calibration.update(globalPacketRate, scanRate, topBehaviorFlow, topStats.TotalPackets(), topRate)
-
-	nullTestActivity := "idle"
-	if config.result.globalPacketCount > 0 {
-		nullTestActivity = "active"
-	}
-
-	args := []any{
-		"windowStart", config.result.windowStart,
-		"windowEnd", windowEnd,
-		"windowSeconds", durationSeconds,
-		"packetCount", config.result.globalPacketCount,
-		"flowCount", len(destinations),
-		"scanTargetCount", len(scanTargets),
-		"scanDetectionMode", config.scanDetectionMode.String(),
-		"globalPacketRate", globalPacketRate,
-		"globalPacketRateAvg", config.calibration.packetRateAvg(),
-		"globalPacketRateMax", config.calibration.packetRateMax,
-		"hostRate", scanRate,
-		"hostRateAvg", config.calibration.hostRateAvg(),
-		"hostRateMax", config.calibration.hostRateMax,
-		"requiredPacketThreshold", topRate,
-		"requiredDestinationThreshold", scanRate,
-		"maxFlow", topLabel,
-		"maxFlowPackets", topStats.TotalPackets(),
-		"maxFlowRate", topRate,
-		"nullTestActivity", nullTestActivity,
-	}
-
-	if topStats.TotalPackets() > 0 {
-		args = append(
-			args,
-			"maxFlowIP", topBehaviorFlow.DstHost.String(),
-			"maxFlowPort", topBehaviorFlow.DstPort,
-			"maxFlowProto", topBehaviorFlow.Protocol,
-		)
-	}
-
-	config.logger.Info("Calibration window", args...)
 }
 
 func (config *AnalysisConfiguration) logLocalBehavior(
@@ -706,7 +528,6 @@ func (config *AnalysisConfiguration) persistPackets(behavior *LocalBehavior, pac
 	return false
 }
 
-
 func (config *AnalysisConfiguration) classificationConfigFor() classificationConfig {
 	cfg := config.classificationConfig
 	cfg.context = &config.context
@@ -737,7 +558,6 @@ func (config *AnalysisConfiguration) shouldEmitGlobalBehavior(behavior *GlobalBe
 	}
 }
 
-
 func randomFlowID() uint64 {
 	for range 16 {
 		var b [8]byte
@@ -751,7 +571,6 @@ func randomFlowID() uint64 {
 	}
 	panic("randomFlowID: failed to generate non-zero ID after 16 attempts")
 }
-
 
 func (config *AnalysisConfiguration) Close() error {
 	if config == nil || config.eventFile == nil {
@@ -767,26 +586,6 @@ func (config *AnalysisConfiguration) Summary() AnalysisSummary {
 		return AnalysisSummary{}
 	}
 	return config.summary
-}
-
-func (config *AnalysisConfiguration) CalibrationSummary() CalibrationSummary {
-	if config == nil {
-		return CalibrationSummary{}
-	}
-
-	stats := config.calibration
-	return CalibrationSummary{
-		Windows:                         stats.windows,
-		PacketRateAvg:                   stats.packetRateAvg(),
-		PacketRateMax:                   stats.packetRateMax,
-		HostRateAvg:                     stats.hostRateAvg(),
-		HostRateMax:                     stats.hostRateMax,
-		RecommendedPacketThreshold:      stats.topFlowRateMax,
-		RecommendedDestinationThreshold: stats.hostRateMax,
-		MaxFlow:                         stats.topFlowCandidate,
-		MaxFlowRate:                     stats.topFlowRateMax,
-		MaxFlowPackets:                  stats.topFlowCountMax,
-	}
 }
 
 func defaultCaptureBehavior(config *AnalysisConfiguration, behavior *LocalBehavior) (bool, error) {
