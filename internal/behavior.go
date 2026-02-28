@@ -74,49 +74,12 @@ func (f BehaviorFlow) String() string {
 	return base
 }
 
-func (b *behaviorBase) setFlowID(id uint64) { b.assignedFlowID = id }
-
-func (b *LocalBehavior) key() behaviorKey {
-	if b == nil {
-		return behaviorKey{}
-	}
-
-	return behaviorKey{
-		Classification: b.Classification,
-		FlowHash:       hashBehaviorFlows([]BehaviorFlow{b.Flow}),
-	}
-}
-
-func (b *GlobalBehavior) key() behaviorKey {
-	if b == nil {
-		return behaviorKey{}
-	}
-
-	return behaviorKey{
-		Classification: b.Classification,
-		FlowHash:       hashBehaviorFlows(b.Flows),
-	}
-}
-
 func (f BehaviorFlow) canonical() BehaviorFlow {
 	if f.DstHost < f.SrcHost || (f.DstHost == f.SrcHost && f.DstPort < f.SrcPort) {
 		f.SrcHost, f.DstHost = f.DstHost, f.SrcHost
 		f.SrcPort, f.DstPort = f.DstPort, f.SrcPort
 	}
 	return f
-}
-
-// behaviorKey identifies behavior by class and normalized flow hash.
-type behaviorKey struct {
-	Classification BehaviorClass
-	FlowHash       uint64
-}
-
-// behavior is implemented by LocalBehavior and GlobalBehavior to support
-// unified flow ID assignment.
-type behavior interface {
-	key() behaviorKey
-	setFlowID(id uint64)
 }
 
 type behaviorBase struct {
@@ -132,7 +95,7 @@ type behaviorBase struct {
 	Context *BehaviorContext `json:"context,omitempty"`
 	context *AnalysisContext `json:"-"`
 
-	// assignedFlowID is set by analysis batching to preserve continuity across adjacent windows.
+	// assignedFlowID is set by the classifier to preserve continuity across adjacent windows.
 	assignedFlowID uint64 `json:"-"`
 }
 
@@ -253,83 +216,43 @@ func NewGlobalBehavior(
 	}
 }
 
-// classificationConfig holds the subset of AnalysisConfiguration needed to
-// construct and classify a behavior from a flow observation.
-type classificationConfig struct {
-	packetThreshold      float64
-	destinationThreshold float64
-	context              *AnalysisContext
+// behaviorKey identifies behavior by class and normalized flow hash.
+type behaviorKey struct {
+	Classification BehaviorClass
+	FlowHash       uint64
 }
 
-// newLocalBehaviorFromFlow constructs a fully-populated LocalBehavior for the
-// given canonical flow and its window statistics, handling orientation,
-// classification, and directional rate computation in a single step.
-func newLocalBehaviorFromFlow(
-	flow Flow,
-	stats normalizedFlowStats,
-	eventTime time.Time,
-	durationSeconds float64,
-	cfg classificationConfig,
-) *LocalBehavior {
-	botHost := cfg.context.botHost
-	behaviorFlow := orientedBehaviorFlow(flow, stats, botHost)
-	packetRate := float64(stats.TotalPackets()) / durationSeconds
+// behavior is implemented by LocalBehavior and GlobalBehavior to support
+// unified flow ID assignment.
+type behavior interface {
+	key() behaviorKey
+	setFlowID(id uint64)
+}
 
-	classification := OutboundConnection
-	if cfg.context.c2Host != 0 && packetRate > cfg.packetThreshold {
-		classification = Attack
+func (b *behaviorBase) setFlowID(id uint64) { b.assignedFlowID = id }
+
+func (b *LocalBehavior) key() behaviorKey {
+	if b == nil {
+		return behaviorKey{}
 	}
-
-	srcToDst, dstToSrc := orientedDirectionStats(flow, stats, botHost)
-	return &LocalBehavior{
-		behaviorBase:    newBehaviorBase(classification, Local, eventTime, packetRate, cfg.packetThreshold, 0, 0, cfg.context),
-		Flow:            behaviorFlow,
-		SrcToDstPackets: srcToDst,
-		DstToSrcPackets: dstToSrc,
-		SrcToDstRate:    float64(srcToDst) / durationSeconds,
-		DstToSrcRate:    float64(dstToSrc) / durationSeconds,
+	return behaviorKey{
+		Classification: b.Classification,
+		FlowHash:       hashBehaviorFlows([]BehaviorFlow{b.Flow}),
 	}
 }
 
-// newGlobalBehaviorFromRates constructs a GlobalBehavior classified as Scan
-// or Idle based on whether scanRate exceeds the configured threshold.
-func newGlobalBehaviorFromRates(
-	globalPacketRate float64,
-	scanRate float64,
-	scanFlows []BehaviorFlow,
-	eventTime time.Time,
-	cfg classificationConfig,
-) *GlobalBehavior {
-	classification := Idle
-	if scanRate > cfg.destinationThreshold {
-		classification = Scan
+func (b *GlobalBehavior) key() behaviorKey {
+	if b == nil {
+		return behaviorKey{}
 	}
-	return NewGlobalBehavior(
-		classification, eventTime,
-		globalPacketRate, cfg.packetThreshold,
-		scanRate, cfg.destinationThreshold,
-		scanFlows, cfg.context,
-	)
+	return behaviorKey{
+		Classification: b.Classification,
+		FlowHash:       hashBehaviorFlows(b.Flows),
+	}
 }
 
-// assignBehaviorFlowID looks up or assigns a stable flow ID for b, persisting
-// it into current for use by subsequent behaviors in the same window.
-func assignBehaviorFlowID(b behavior, current, previous map[behaviorKey]uint64) {
-	key := b.key()
-	if id, ok := current[key]; ok {
-		b.setFlowID(id)
-		return
-	}
-	if id, ok := previous[key]; ok {
-		b.setFlowID(id)
-		current[key] = id
-		return
-	}
-	id := randomFlowID()
-	b.setFlowID(id)
-	current[key] = id
-}
-
+// hashBehaviorFlows produces a stable hash over a set of flows, independent of
+// order and endpoint orientation.
 func hashBehaviorFlows(flows []BehaviorFlow) uint64 {
 	if len(flows) == 0 {
 		return 0

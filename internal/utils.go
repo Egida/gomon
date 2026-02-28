@@ -1,6 +1,10 @@
 package internal
 
 import (
+	"crypto/rand"
+	"encoding/binary"
+	"log/slog"
+
 	"github.com/google/gopacket"
 )
 
@@ -166,22 +170,6 @@ func chooseSourceEndpoint(flow Flow, stats normalizedFlowStats, botHost Host) bo
 	return true // canonical: src ≤ dst
 }
 
-func orientedBehaviorFlow(flow Flow, stats normalizedFlowStats, botHost Host) BehaviorFlow {
-	srcHost, dstHost := flow.Hosts()
-	srcPort, dstPort := flow.Ports()
-	if !chooseSourceEndpoint(flow, stats, botHost) {
-		srcHost, dstHost = dstHost, srcHost
-		srcPort, dstPort = dstPort, srcPort
-	}
-	return BehaviorFlow{
-		SrcHost:  srcHost,
-		SrcPort:  srcPort,
-		DstHost:  dstHost,
-		DstPort:  dstPort,
-		Protocol: flow.Protocol(),
-	}
-}
-
 func orientedDirectionStats(
 	flow Flow,
 	stats normalizedFlowStats,
@@ -191,25 +179,6 @@ func orientedDirectionStats(
 		return stats.PacketsAToB, stats.PacketsBToA
 	}
 	return stats.PacketsBToA, stats.PacketsAToB
-}
-
-func flowsFromCounts(flows normalizedFlowCounts, botHost Host) []BehaviorFlow {
-	if len(flows) == 0 {
-		return nil
-	}
-
-	list := make([]BehaviorFlow, 0, len(flows))
-	for flow, stats := range flows {
-		behaviorFlow := orientedBehaviorFlow(flow, stats, botHost)
-		if behaviorFlow.DstHost == 0 {
-			continue
-		}
-		list = append(list, behaviorFlow)
-	}
-	if len(list) == 0 {
-		return nil
-	}
-	return list
 }
 
 func filterNonAttackingFlows(
@@ -231,6 +200,27 @@ func filterNonAttackingFlows(
 	return filtered
 }
 
+func computeScanRate(durationSeconds float64, hostCount int) float64 {
+	if durationSeconds <= 0 || hostCount <= 0 {
+		return 0
+	}
+
+	return float64(hostCount) / durationSeconds
+}
+
+func randomFlowID() uint64 {
+	for range 16 {
+		var b [8]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			slog.Error("Failed to read random bytes for flow ID", "error", err)
+			continue
+		}
+		if id := binary.BigEndian.Uint64(b[:]); id != 0 {
+			return id
+		}
+	}
+	panic("randomFlowID: failed to generate non-zero ID after 16 attempts")
+}
 
 func uniqueHosts(flows []BehaviorFlow) []BehaviorFlow {
 	if len(flows) == 0 {
@@ -296,10 +286,37 @@ func hostsFromFlows(flows []BehaviorFlow) map[Host]bool {
 	return out
 }
 
-func computeScanRate(durationSeconds float64, hostCount int) float64 {
-	if durationSeconds <= 0 || hostCount <= 0 {
-		return 0
+func orientedBehaviorFlow(flow Flow, stats normalizedFlowStats, botHost Host) BehaviorFlow {
+	srcHost, dstHost := flow.Hosts()
+	srcPort, dstPort := flow.Ports()
+	if !chooseSourceEndpoint(flow, stats, botHost) {
+		srcHost, dstHost = dstHost, srcHost
+		srcPort, dstPort = dstPort, srcPort
+	}
+	return BehaviorFlow{
+		SrcHost:  srcHost,
+		SrcPort:  srcPort,
+		DstHost:  dstHost,
+		DstPort:  dstPort,
+		Protocol: flow.Protocol(),
+	}
+}
+
+func flowsFromCounts(flows normalizedFlowCounts, botHost Host) []BehaviorFlow {
+	if len(flows) == 0 {
+		return nil
 	}
 
-	return float64(hostCount) / durationSeconds
+	list := make([]BehaviorFlow, 0, len(flows))
+	for flow, stats := range flows {
+		behaviorFlow := orientedBehaviorFlow(flow, stats, botHost)
+		if behaviorFlow.DstHost == 0 {
+			continue
+		}
+		list = append(list, behaviorFlow)
+	}
+	if len(list) == 0 {
+		return nil
+	}
+	return list
 }

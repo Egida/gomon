@@ -226,7 +226,7 @@ func TestOutboundResumesAfterScanWindow(t *testing.T) {
 func TestNewHostRateOnlyCountsNewAcrossWindows(t *testing.T) {
 	buf := &bytes.Buffer{}
 	config := newTestAnalysisConfigWithC2(buf, "", 100, 2)
-	config.scanDetectionMode = ScanDetectionNewHostRate
+	config.classifier.scanDetectionMode = ScanDetectionNewHostRate
 
 	now := time.Now()
 
@@ -312,7 +312,7 @@ func TestSingleDestinationBurstDoesNotTriggerScan(t *testing.T) {
 func TestScanIgnoresAttackDestinations(t *testing.T) {
 	buf := &bytes.Buffer{}
 	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 1, 2)
-	config.scanDetectionMode = ScanDetectionFilteredHostRate
+	config.classifier.scanDetectionMode = ScanDetectionFilteredHostRate
 
 	packets := []gopacket.Packet{
 		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.10", 22),
