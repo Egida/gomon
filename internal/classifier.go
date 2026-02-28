@@ -31,57 +31,6 @@ func assignBehaviorFlowID(b behavior, current, previous map[behaviorKey]uint64) 
 	current[key] = id
 }
 
-// newLocalBehaviorFromFlow constructs a fully-populated LocalBehavior for the
-// given canonical flow and its window statistics, handling orientation,
-// classification, and directional rate computation in a single step.
-func newLocalBehaviorFromFlow(
-	flow Flow,
-	stats normalizedFlowStats,
-	eventTime time.Time,
-	durationSeconds float64,
-	cfg classificationConfig,
-) *LocalBehavior {
-	botHost := cfg.context.botHost
-	behaviorFlow := orientedBehaviorFlow(flow, stats, botHost)
-	packetRate := float64(stats.TotalPackets()) / durationSeconds
-
-	classification := OutboundConnection
-	if cfg.context.c2Host != 0 && packetRate > cfg.packetThreshold {
-		classification = Attack
-	}
-
-	srcToDst, dstToSrc := orientedDirectionStats(flow, stats, botHost)
-	return &LocalBehavior{
-		behaviorBase:    newBehaviorBase(classification, Local, eventTime, packetRate, cfg.packetThreshold, 0, 0, cfg.context),
-		Flow:            behaviorFlow,
-		SrcToDstPackets: srcToDst,
-		DstToSrcPackets: dstToSrc,
-		SrcToDstRate:    float64(srcToDst) / durationSeconds,
-		DstToSrcRate:    float64(dstToSrc) / durationSeconds,
-	}
-}
-
-// newGlobalBehaviorFromRates constructs a GlobalBehavior classified as Scan
-// or Idle based on whether scanRate exceeds the configured threshold.
-func newGlobalBehaviorFromRates(
-	globalPacketRate float64,
-	scanRate float64,
-	scanFlows []BehaviorFlow,
-	eventTime time.Time,
-	cfg classificationConfig,
-) *GlobalBehavior {
-	classification := Idle
-	if scanRate > cfg.destinationThreshold {
-		classification = Scan
-	}
-	return NewGlobalBehavior(
-		classification, eventTime,
-		globalPacketRate, cfg.packetThreshold,
-		scanRate, cfg.destinationThreshold,
-		scanFlows, cfg.context,
-	)
-}
-
 // localBehaviorResult pairs a classified LocalBehavior with the canonical flow
 // key used to look up captured packets.
 type localBehaviorResult struct {
@@ -153,7 +102,7 @@ func (c *BehaviorClassifier) Classify(stats WindowStats) ClassificationResult {
 	attacked := make(map[Host]bool)
 
 	for flow, flowStats := range stats.FlowCounts {
-		localBehavior := newLocalBehaviorFromFlow(flow, flowStats, stats.Start, durationSeconds, cfg)
+		localBehavior := c.classifyLocalBehavior(flow, flowStats, stats.Start, durationSeconds)
 		localBehaviors = append(localBehaviors, localBehaviorResult{behavior: localBehavior, key: flow})
 		if localBehavior.Classification == Attack && localBehavior.Flow.DstHost != 0 {
 			attacked[localBehavior.Flow.DstHost] = true
@@ -186,7 +135,7 @@ func (c *BehaviorClassifier) Classify(stats WindowStats) ClassificationResult {
 
 	globalPacketRate := float64(stats.GlobalPacketCount) / durationSeconds
 	scanRate := computeScanRate(durationSeconds, len(scanTargets))
-	globalBehavior := newGlobalBehaviorFromRates(globalPacketRate, scanRate, scanTargets, stats.Start, cfg)
+	globalBehavior := c.classifyGlobalBehavior(globalPacketRate, scanRate, scanTargets, stats.Start)
 
 	currentLocalIDs := make(map[behaviorKey]uint64)
 	currentGlobalIDs := make(map[behaviorKey]uint64)
@@ -203,4 +152,65 @@ func (c *BehaviorClassifier) Classify(stats WindowStats) ClassificationResult {
 		LocalBehaviors: localBehaviors,
 		GlobalBehavior: globalBehavior,
 	}
+}
+
+// classifyLocalBehavior constructs a fully-populated LocalBehavior for the
+// given canonical flow and its window statistics, handling orientation,
+// classification, and directional rate computation in a single step.
+func (c *BehaviorClassifier) classifyLocalBehavior(
+	flow Flow,
+	stats normalizedFlowStats,
+	eventTime time.Time,
+	durationSeconds float64,
+) *LocalBehavior {
+	cfg := c.classificationConfig
+	botHost := c.classificationConfig.context.botHost
+	behaviorFlow := orientedBehaviorFlow(flow, stats, botHost)
+	packetRate := float64(stats.TotalPackets()) / durationSeconds
+
+	classification := OutboundConnection
+	if c.context.c2Host != 0 && packetRate > cfg.packetThreshold {
+		classification = Attack
+	}
+
+	srcToDst, dstToSrc := orientedDirectionStats(flow, stats, botHost)
+	return &LocalBehavior{
+		behaviorBase: newBehaviorBase(
+			classification,
+			Local,
+			eventTime,
+			packetRate,
+			cfg.packetThreshold,
+			0,
+			0,
+			cfg.context,
+		),
+		Flow:            behaviorFlow,
+		SrcToDstPackets: srcToDst,
+		DstToSrcPackets: dstToSrc,
+		SrcToDstRate:    float64(srcToDst) / durationSeconds,
+		DstToSrcRate:    float64(dstToSrc) / durationSeconds,
+	}
+}
+
+// newGlobalBehaviorFromRates constructs a GlobalBehavior classified as Scan
+// or Idle based on whether scanRate exceeds the configured threshold.
+func (c *BehaviorClassifier) classifyGlobalBehavior(
+	globalPacketRate float64,
+	scanRate float64,
+	scanFlows []BehaviorFlow,
+	eventTime time.Time,
+) *GlobalBehavior {
+	cfg := c.classificationConfig
+
+	classification := Idle
+	if scanRate > cfg.destinationThreshold {
+		classification = Scan
+	}
+	return NewGlobalBehavior(
+		classification, eventTime,
+		globalPacketRate, cfg.packetThreshold,
+		scanRate, cfg.destinationThreshold,
+		scanFlows, cfg.context,
+	)
 }
